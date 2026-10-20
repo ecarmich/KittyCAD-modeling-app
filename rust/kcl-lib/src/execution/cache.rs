@@ -1,5 +1,6 @@
 //! Functions for helping with caching an ast and finding the parts the changed.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -9,6 +10,7 @@ use kcl_api::Object;
 use kcl_api::ObjectId;
 use kittycad_modeling_cmds::KclVersion;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::ExecOutcome;
 use crate::ExecutorContext;
@@ -31,6 +33,7 @@ use crate::modules::ModuleId;
 use crate::modules::ModulePath;
 use crate::modules::ModuleSource;
 use crate::parsing::ast::types::Annotation;
+use crate::parsing::ast::types::BodyItem;
 use crate::parsing::ast::types::Node;
 use crate::parsing::ast::types::Program;
 use crate::walk::Node as WalkNode;
@@ -309,13 +312,41 @@ pub(super) enum CacheResult {
     },
     /// Argument is whether we need to reapply settings.
     NoAction(bool),
+    /// Statements were removed from the trailing end of the program, and every
+    /// removed statement's value (if any) was a geometry kind whose engine
+    /// object ids we can identify from the last successful run. Rather than
+    /// clearing and re-executing the whole scene, delete just those engine
+    /// objects. Nothing needs to be re-executed, since nothing after the
+    /// deletion point exists in the new program.
+    SurgicalDelete {
+        /// The engine object ids to remove. May be empty, if the deleted
+        /// statements didn't produce any scene geometry (e.g. they only bound
+        /// plain values).
+        object_ids: HashSet<Uuid>,
+        /// Do we need to reapply settings?
+        reapply_settings: bool,
+    },
 }
 
 /// Given an old ast, old program memory and new ast, find the parts of the code that need to be
 /// re-executed.
+///
+/// `old_vars` lazily returns the top-level variable bindings from the end of the last successful
+/// execution (i.e. the values `old.ast` produced), or `None` if they're not available (e.g. there
+/// was no previous successful execution). It's used to recognize a "pure delete" of statements
+/// from the end of the program without re-executing or clearing the scene; a pure delete falls
+/// back to a full cache bust, same as before this was supported, if it returns `None`. It's a
+/// closure, rather than the bindings themselves, because computing them snapshots (and so clones)
+/// every top-level value, which would be wasted work on every other kind of cache hit - it's only
+/// called if we actually find a pure trailing delete to classify.
+///
 /// This function should never error, because in the case of any internal error, we should just pop
 /// the cache.
-pub(super) async fn get_changed_program(old: CacheInformation<'_>, new: CacheInformation<'_>) -> CacheResult {
+pub(super) async fn get_changed_program(
+    old: CacheInformation<'_>,
+    new: CacheInformation<'_>,
+    old_vars: impl FnOnce() -> Option<IndexMap<String, KclValue>>,
+) -> CacheResult {
     let mut reapply_settings = false;
 
     if old.kcl_version != new.kcl_version {
@@ -419,7 +450,189 @@ pub(super) async fn get_changed_program(old: CacheInformation<'_>, new: CacheInf
     }
 
     // Check if the changes were only to Non-code areas, like comments or whitespace.
-    generate_changed_program(old_ast, new_ast, reapply_settings)
+    generate_changed_program(old_ast, new_ast, reapply_settings, old_vars)
+}
+
+/// Given a slice of top-level statements that were deleted (from the trailing
+/// end of a program) and the variable bindings in effect at the end of the
+/// last successful execution of the program they came from, return the set of
+/// engine object ids those statements are safely known to have produced, or
+/// `None` if any deleted statement isn't safe to treat as a pure delete.
+///
+/// A deleted statement is safe only if it's a single-name variable
+/// declaration (the only kind KCL has) whose bound value is entirely made of
+/// solids (or a homogeneous array of solids) - see [`kcl_value_solid_ids`] for
+/// why sketches, planes, helices, imported geometry and GD&T annotations are
+/// deliberately *not* included, even though the `delete()` builtin handles
+/// all of those. Anything else (a bare expression statement, a
+/// type/import/return statement, or a value we can't classify) makes the
+/// whole deletion unsafe, so the caller falls back to a full cache bust
+/// rather than risk leaving stale geometry in the scene.
+///
+/// Even once a candidate set of ids is found, it's rejected (and the caller
+/// falls back to a full cache bust) if any of those ids are *also* reachable
+/// from a binding that is NOT being deleted - see [`kcl_value_referenced_ids`].
+/// A deleted statement's own binding being the only thing pointing at an id is
+/// what makes it safe to delete; two different names can easily resolve to
+/// the exact same engine entity (e.g. `b = a`, or two sketches started on the
+/// same already-existing face), and deleting it out from under a surviving
+/// binding would desync the scene from the code instead of fixing that.
+fn ids_for_deleted_statements(deleted: &[BodyItem], old_vars: &IndexMap<String, KclValue>) -> Option<HashSet<Uuid>> {
+    let mut deleted_names = std::collections::HashSet::new();
+    let mut object_ids = HashSet::new();
+    for item in deleted {
+        let BodyItem::VariableDeclaration(decl) = item else {
+            return None;
+        };
+        let name = &decl.declaration.id.name;
+        let value = old_vars.get(name)?;
+        let ids = kcl_value_solid_ids(value)?;
+        object_ids.extend(ids);
+        deleted_names.insert(name.as_str());
+    }
+
+    for (name, value) in old_vars {
+        if deleted_names.contains(name.as_str()) {
+            continue;
+        }
+        let mut surviving_ids = HashSet::new();
+        kcl_value_referenced_ids(value, &mut surviving_ids);
+        if !object_ids.is_disjoint(&surviving_ids) {
+            return None;
+        }
+    }
+
+    Some(object_ids)
+}
+
+/// Returns the engine object ids a [`KclValue`] refers to, if it's entirely
+/// made of solids (or a homogeneous array of solids): `Some(ids)` where
+/// `ids` is empty for a value that can't possibly reference scene geometry
+/// (numbers, strings, tags, etc.), or `None` if the value isn't one we can
+/// safely reason about (so the caller must be conservative and assume it
+/// might), including every other geometry kind.
+///
+/// Solids are the only kind included here, even though [`kcl_value_referenced_ids`]
+/// (and the `delete()` builtin) also handle sketches, planes, helices,
+/// imported geometry and GD&T annotations. A `Sketch`'s or `Plane`'s id is
+/// often not an engine entity exclusively "owned" by the statement that
+/// bound it: sketching on a plane or an existing face reuses that surface's
+/// id, including default planes (`XY`/`XZ`/`YZ`) that are shared globally,
+/// not created per-statement. Deleting one of those ids out from under a
+/// deleted statement's binding can delete a surface something else (another
+/// sketch, a later `startSketchOn`, another default-plane use) still relies
+/// on, since nothing about that sharing is visible as a reference to the
+/// deleted statement's *name* - it only shows up as the same *id* appearing
+/// elsewhere, which only the solid-only whitelist here plus the overlap
+/// check in [`ids_for_deleted_statements`] can't fully rule out for those
+/// kinds. A solid's own id isn't shared the same way: it changes as
+/// operations are applied to that one solid, but isn't reused as some other,
+/// unrelated object's id the way a plane or face can be.
+fn kcl_value_solid_ids(value: &KclValue) -> Option<Vec<Uuid>> {
+    match value {
+        KclValue::Solid { value } => Some(vec![value.id]),
+        KclValue::HomArray { value, .. } => {
+            let mut ids = Vec::new();
+            for element in value {
+                ids.extend(kcl_value_solid_ids(element)?);
+            }
+            Some(ids)
+        }
+        KclValue::Uuid { .. }
+        | KclValue::Bool { .. }
+        | KclValue::Number { .. }
+        | KclValue::String { .. }
+        | KclValue::Enum { .. }
+        | KclValue::TagIdentifier(_)
+        | KclValue::TagDeclarator(_)
+        | KclValue::KclNone { .. } => Some(Vec::new()),
+        // Every other variant (including Sketch/Plane/Helix/ImportedGeometry/
+        // GdtAnnotation - see above) is deliberately not whitelisted: new
+        // variants, or any value we're not certain about, should fail closed
+        // (fall back to a full cache bust) rather than silently miss an id
+        // to delete, or delete one that's shared.
+        KclValue::SketchVar { .. }
+        | KclValue::SketchConstraint { .. }
+        | KclValue::Tuple { .. }
+        | KclValue::Object { .. }
+        | KclValue::Face { .. }
+        | KclValue::BoundedEdge { .. }
+        | KclValue::Segment { .. }
+        | KclValue::CameraView { .. }
+        | KclValue::NamedView { .. }
+        | KclValue::Function { .. }
+        | KclValue::Module { .. }
+        | KclValue::Type { .. }
+        | KclValue::Sketch { .. }
+        | KclValue::Plane { .. }
+        | KclValue::Helix { .. }
+        | KclValue::ImportedGeometry(_)
+        | KclValue::GdtAnnotation { .. } => None,
+    }
+}
+
+/// Best-effort, deliberately broad collection of every engine object id
+/// reachable from a [`KclValue`], recursing into every container-like
+/// variant (arrays, tuples, object fields). Used only as a safety net (see
+/// [`ids_for_deleted_statements`]) to check whether an id a deleted statement
+/// bound is *also* reachable from a surviving binding - so unlike
+/// [`kcl_value_solid_ids`], erring on the side of collecting more ids here is
+/// the safe direction, not the risky one: a false positive just means an
+/// extra cache bust, while a false negative (missing a real alias) is the
+/// kind of bug this function exists to catch.
+fn kcl_value_referenced_ids(value: &KclValue, ids: &mut HashSet<Uuid>) {
+    match value {
+        KclValue::Solid { value } => {
+            ids.insert(value.id);
+        }
+        KclValue::Sketch { value } => {
+            ids.insert(value.id);
+        }
+        KclValue::Plane { value } => {
+            ids.insert(value.id);
+        }
+        KclValue::Helix { value } => {
+            ids.insert(value.value);
+        }
+        KclValue::GdtAnnotation { value } => {
+            ids.insert(value.id);
+        }
+        KclValue::ImportedGeometry(value) => {
+            ids.insert(value.id);
+        }
+        KclValue::Uuid { value, .. } => {
+            ids.insert(*value);
+        }
+        KclValue::HomArray { value, .. } | KclValue::Tuple { value, .. } => {
+            for element in value {
+                kcl_value_referenced_ids(element, ids);
+            }
+        }
+        KclValue::Object { value, .. } => {
+            // Order doesn't matter: every value just gets unioned into `ids`.
+            #[allow(clippy::iter_over_hash_type)]
+            for element in value.values() {
+                kcl_value_referenced_ids(element, ids);
+            }
+        }
+        KclValue::Bool { .. }
+        | KclValue::Number { .. }
+        | KclValue::String { .. }
+        | KclValue::Enum { .. }
+        | KclValue::TagIdentifier(_)
+        | KclValue::TagDeclarator(_)
+        | KclValue::KclNone { .. }
+        | KclValue::SketchVar { .. }
+        | KclValue::SketchConstraint { .. }
+        | KclValue::Face { .. }
+        | KclValue::BoundedEdge { .. }
+        | KclValue::Segment { .. }
+        | KclValue::CameraView { .. }
+        | KclValue::NamedView { .. }
+        | KclValue::Function { .. }
+        | KclValue::Module { .. }
+        | KclValue::Type { .. } => {}
+    }
 }
 
 /// Force-generate a new CacheResult, even if one shouldn't be made. The
@@ -433,7 +646,12 @@ pub(super) async fn get_changed_program(old: CacheInformation<'_>, new: CacheInf
 /// as it will be incomplete.
 ///
 /// Digests *must* be computed before calling this.
-fn generate_changed_program(old_ast: Node<Program>, mut new_ast: Node<Program>, reapply_settings: bool) -> CacheResult {
+fn generate_changed_program(
+    old_ast: Node<Program>,
+    mut new_ast: Node<Program>,
+    reapply_settings: bool,
+    old_vars: impl FnOnce() -> Option<IndexMap<String, KclValue>>,
+) -> CacheResult {
     if !old_ast.body.iter().zip(new_ast.body.iter()).all(|(old, new)| {
         let old_node: WalkNode = old.into();
         let new_node: WalkNode = new.into();
@@ -456,18 +674,22 @@ fn generate_changed_program(old_ast: Node<Program>, mut new_ast: Node<Program>, 
 
     match new_ast.body.len().cmp(&old_ast.body.len()) {
         std::cmp::Ordering::Less => {
-            // the new AST is shorter than the old AST -- statements
-            // were removed from the "current" code in the "new" code.
-            //
-            // Statements up until now match which means this is a
-            // "pure delete" of the remaining slice, when we get to
-            // supporting that.
-
-            // Cache bust time.
-            CacheResult::ReExecute {
-                clear_scene: true,
-                reapply_settings,
-                program: new_ast,
+            // The new AST is shorter than the old AST: statements were
+            // removed from the end of the program (the overlapping prefix
+            // matched above). If we know what each deleted statement bound
+            // and it's all engine geometry (or nothing), we can delete just
+            // those engine objects instead of busting the whole scene.
+            let deleted = &old_ast.body[new_ast.body.len()..];
+            match old_vars().and_then(|old_vars| ids_for_deleted_statements(deleted, &old_vars)) {
+                Some(object_ids) => CacheResult::SurgicalDelete {
+                    object_ids,
+                    reapply_settings,
+                },
+                None => CacheResult::ReExecute {
+                    clear_scene: true,
+                    reapply_settings,
+                    program: new_ast,
+                },
             }
         }
         std::cmp::Ordering::Greater => {
@@ -529,6 +751,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -569,6 +792,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&program_new.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -609,6 +833,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&program_new.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -653,6 +878,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&program_new.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -685,6 +911,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &Default::default()),
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -717,6 +944,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &Default::default()),
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -729,6 +957,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &old_settings),
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -741,6 +970,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &old_settings),
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -769,6 +999,7 @@ shell(firstSketch, faces = [END], thickness = 0.25)"#;
             let result = get_changed_program(
                 CacheInformation::new(&program.ast, &settings),
                 CacheInformation::new(&new_program.ast, &settings),
+                || None,
             )
             .await;
 
@@ -803,6 +1034,7 @@ startSketchOn(XY)
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -836,6 +1068,7 @@ startSketchOn(XY)
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -900,6 +1133,7 @@ extrude(profile001, length = 100)"#
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -979,6 +1213,7 @@ extrude(profile001, length = 100)
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -1006,6 +1241,7 @@ import "tests/inputs/cube.step"
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            || None,
         )
         .await;
 
@@ -1037,6 +1273,240 @@ import "tests/inputs/cube.step"
         let result = get_changed_program(
             CacheInformation::new(&program.ast, &exec_ctxt.settings),
             CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            || None,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            CacheResult::ReExecute {
+                clear_scene: true,
+                reapply_settings: false,
+                program: new_program.ast,
+            }
+        );
+        exec_ctxt.close().await;
+    }
+
+    // A single statement that both sketches and extrudes, bound to one name
+    // and referencing nothing else - so nothing else in a program using this
+    // can alias its solid's id.
+    const SOLID_PROGRAM: &str = r#"solid = startSketchOn(XZ)
+  |> circle(center = [0, 0], radius = 4mm)
+  |> extrude(length = 4mm)
+"#;
+
+    // A sketch-then-extrude program where the profile is kept bound after
+    // the extrude - the realistic shape of code that keeps a sketch around
+    // for a later `startSketchOn(face)`, etc.
+    const EXTRUDE_FROM_NAMED_PROFILE_PROGRAM: &str = r#"@settings(kclVersion = 3.0)
+profile = sketch(on = XZ) {
+  bottom = line(start = [-4mm, -4mm], end = [4mm, -4mm])
+  right = line(start = [4mm, -4mm], end = [4mm, 4mm])
+  top = line(start = [4mm, 4mm], end = [-4mm, 4mm])
+  left = line(start = [-4mm, 4mm], end = [-4mm, -4mm])
+}
+profileRegion = region(segments = [profile.bottom, profile.right, profile.top, profile.left])
+"#;
+
+    // Deleting a trailing `solid = ...` statement whose solid doesn't alias
+    // any surviving binding should be recognized as a pure delete: no
+    // re-execution, just remove the solid's engine object.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_changed_program_trailing_delete_of_unaliased_solid_is_surgical() {
+        let old_code = SOLID_PROGRAM;
+        let new_code = "";
+
+        let ExecTestResults {
+            program,
+            exec_ctxt,
+            exec_state,
+            mem_env,
+        } = parse_execute(old_code).await.unwrap();
+        let old_vars = exec_state.mod_local.variables(mem_env).unwrap();
+        let solid_id = match old_vars.get("solid").unwrap() {
+            KclValue::Solid { value } => value.id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+
+        let mut new_program = crate::Program::parse_no_errs(new_code).unwrap();
+        new_program.compute_digest();
+
+        let result = get_changed_program(
+            CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            move || Some(old_vars),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            CacheResult::SurgicalDelete {
+                object_ids: HashSet::from([solid_id]),
+                reapply_settings: false,
+            }
+        );
+        exec_ctxt.close().await;
+    }
+
+    // Regression test: `extrude()` reuses the extruded sketch/region's own id
+    // as the resulting solid's id (see `kcl_lib::std::extrude::inner_extrude`,
+    // `let id = sketch.id;`). So if the profile that was extruded is *also*
+    // still bound to a surviving variable (a realistic pattern - keeping a
+    // profile around to sketch on one of the resulting faces, etc.), deleting
+    // just the trailing `solid = extrude(...)` statement would delete an
+    // engine object the surviving `profileRegion` binding still points at.
+    // That must NOT be treated as a safe surgical delete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_changed_program_trailing_delete_of_solid_aliasing_surviving_profile_falls_back() {
+        let old_code = format!("{EXTRUDE_FROM_NAMED_PROFILE_PROGRAM}solid = extrude(profileRegion, length = 4mm)\n");
+        let new_code = EXTRUDE_FROM_NAMED_PROFILE_PROGRAM;
+
+        let ExecTestResults {
+            program,
+            exec_ctxt,
+            exec_state,
+            mem_env,
+        } = parse_execute(&old_code).await.unwrap();
+        let old_vars = exec_state.mod_local.variables(mem_env).unwrap();
+        // Confirm the premise: the solid really does alias the surviving
+        // profileRegion's id, which is *why* this must fall back.
+        let solid_id = match old_vars.get("solid").unwrap() {
+            KclValue::Solid { value } => value.id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let mut profile_region_ids = HashSet::new();
+        kcl_value_referenced_ids(old_vars.get("profileRegion").unwrap(), &mut profile_region_ids);
+        assert!(
+            profile_region_ids.contains(&solid_id),
+            "test premise failed: expected the solid's id to alias profileRegion's"
+        );
+
+        let mut new_program = crate::Program::parse_no_errs(new_code).unwrap();
+        new_program.compute_digest();
+
+        let result = get_changed_program(
+            CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            move || Some(old_vars),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            CacheResult::ReExecute {
+                clear_scene: true,
+                reapply_settings: false,
+                program: new_program.ast,
+            }
+        );
+        exec_ctxt.close().await;
+    }
+
+    // Regression test: a deleted sketch/plane-valued statement must never be
+    // treated as a safe surgical delete, even though `delete()` (the KCL
+    // builtin) handles sketches and planes just fine. A `Sketch`'s or
+    // `Plane`'s id is routinely the id of a shared surface (a default plane,
+    // or another solid's face) rather than something exclusively created by
+    // the statement that bound it - deleting it can corrupt a surface
+    // unrelated code still relies on, with no reference to the deleted
+    // statement's *name* anywhere nearby to warn us.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_changed_program_trailing_delete_of_plane_falls_back_to_clear_scene() {
+        let old_code = r#"sketch001 = startSketchOn(XY)
+"#;
+        let new_code = "";
+
+        let ExecTestResults {
+            program,
+            exec_ctxt,
+            exec_state,
+            mem_env,
+        } = parse_execute(old_code).await.unwrap();
+        let old_vars = exec_state.mod_local.variables(mem_env).unwrap();
+        assert!(matches!(old_vars.get("sketch001").unwrap(), KclValue::Plane { .. }));
+
+        let mut new_program = crate::Program::parse_no_errs(new_code).unwrap();
+        new_program.compute_digest();
+
+        let result = get_changed_program(
+            CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            move || Some(old_vars),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            CacheResult::ReExecute {
+                clear_scene: true,
+                reapply_settings: false,
+                program: new_program.ast,
+            }
+        );
+        exec_ctxt.close().await;
+    }
+
+    // Deleting a trailing statement that only binds a plain value (nothing
+    // that maps to engine geometry) is also a safe pure delete, just with no
+    // engine objects to remove.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_changed_program_trailing_delete_of_plain_value_is_surgical_with_no_ids() {
+        let old_code = format!("{SOLID_PROGRAM}x = 5\n");
+        let new_code = SOLID_PROGRAM;
+
+        let ExecTestResults {
+            program,
+            exec_ctxt,
+            exec_state,
+            mem_env,
+        } = parse_execute(&old_code).await.unwrap();
+        let old_vars = exec_state.mod_local.variables(mem_env).unwrap();
+
+        let mut new_program = crate::Program::parse_no_errs(new_code).unwrap();
+        new_program.compute_digest();
+
+        let result = get_changed_program(
+            CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            move || Some(old_vars),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            CacheResult::SurgicalDelete {
+                object_ids: HashSet::new(),
+                reapply_settings: false,
+            }
+        );
+        exec_ctxt.close().await;
+    }
+
+    // Deleting a trailing statement that doesn't bind a name at all (a bare
+    // expression statement) isn't something we can safely classify, so it
+    // must fall back to a full cache bust, same as before surgical deletes
+    // were supported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_changed_program_trailing_delete_of_bare_expression_falls_back_to_clear_scene() {
+        let old_code = format!("{SOLID_PROGRAM}solid\n");
+        let new_code = SOLID_PROGRAM;
+
+        let ExecTestResults {
+            program,
+            exec_ctxt,
+            exec_state,
+            mem_env,
+        } = parse_execute(&old_code).await.unwrap();
+        let old_vars = exec_state.mod_local.variables(mem_env).unwrap();
+
+        let mut new_program = crate::Program::parse_no_errs(new_code).unwrap();
+        new_program.compute_digest();
+
+        let result = get_changed_program(
+            CacheInformation::new(&program.ast, &exec_ctxt.settings),
+            CacheInformation::new(&new_program.ast, &exec_ctxt.settings),
+            move || Some(old_vars),
         )
         .await;
 

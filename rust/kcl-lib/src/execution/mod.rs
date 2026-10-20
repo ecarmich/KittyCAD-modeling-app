@@ -1,6 +1,7 @@
 //! The executor for the AST.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -1500,6 +1501,36 @@ impl ExecutorContext {
         self.is_mock()
     }
 
+    /// Delete specific engine scene objects, without clearing or
+    /// re-executing anything else. Unlike [`Self::send_clear_scene`], this
+    /// doesn't reset any of `exec_state`'s artifact bookkeeping: the normal
+    /// artifact-graph processing (triggered by the `RemoveSceneObjects`
+    /// command passing through, same as the `delete()` builtin) marks the
+    /// deleted objects consumed. A no-op if `object_ids` is empty.
+    async fn send_remove_scene_objects(
+        &self,
+        exec_state: &mut ExecState,
+        object_ids: HashSet<uuid::Uuid>,
+        source_range: crate::execution::SourceRange,
+    ) -> Result<(), KclError> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
+
+        let cmd_id = exec_state.next_uuid();
+        exec_state
+            .batch_modeling_cmd(
+                ModelingCmdMeta::with_id(exec_state, self, source_range, cmd_id),
+                ModelingCmd::from(mcmd::RemoveSceneObjects::builder().object_ids(object_ids).build()),
+            )
+            .await?;
+        // Flush right away, same as `clear_scene`: a surgical delete may be
+        // returned from `prepare_cached_execution` without a further
+        // execution pass to flush it for us.
+        self.engine.flush_batch(&self.engine_batch, false, source_range).await?;
+        Ok(())
+    }
+
     pub async fn send_clear_scene(
         &self,
         kcl_version: Option<KclVersion>,
@@ -1757,7 +1788,17 @@ impl ExecutorContext {
                     };
 
                     // Get the program that actually changed from the old and new information.
-                    let (clear_scene, program, import_check_info) = match cache::get_changed_program(old, new).await {
+                    // `old_vars` is only computed (it snapshots every top-level value) if a
+                    // pure trailing delete is found to classify; see `CacheResult::SurgicalDelete`.
+                    let cache_result = cache::get_changed_program(old, new, || {
+                        cached_state
+                            .main
+                            .exec_state
+                            .variables(cached_state.main.result_env)
+                            .ok()
+                    })
+                    .await;
+                    let (clear_scene, program, import_check_info, object_ids_to_remove) = match cache_result {
                         CacheResult::ReExecute {
                             clear_scene,
                             reapply_settings,
@@ -1776,7 +1817,7 @@ impl ExecutorContext {
                                     .await
                                     .is_err()
                             {
-                                (true, program, None)
+                                (true, program, None, HashSet::new())
                             } else {
                                 (
                                     clear_scene,
@@ -1786,6 +1827,48 @@ impl ExecutorContext {
                                         original_file_contents: program.original_file_contents,
                                     },
                                     None,
+                                    HashSet::new(),
+                                )
+                            }
+                        }
+                        CacheResult::SurgicalDelete {
+                            object_ids,
+                            reapply_settings,
+                        } => {
+                            if reapply_settings
+                                && self
+                                    .engine
+                                    .reapply_settings(
+                                        &self.engine_batch,
+                                        &self.settings,
+                                        Default::default(),
+                                        &mut cached_state.main.exec_state.id_generator,
+                                        grid_scale,
+                                    )
+                                    .await
+                                    .is_err()
+                            {
+                                // Reapplying settings failed: fall back to a
+                                // full re-execute, same as the ReExecute arm
+                                // above does in this situation.
+                                (true, program, None, HashSet::new())
+                            } else {
+                                // Nothing needs to be (re-)executed: the
+                                // surviving statements already ran in the
+                                // last successful execution, and the deleted
+                                // ones are handled below by removing their
+                                // engine objects, not by running any KCL.
+                                (
+                                    false,
+                                    crate::Program {
+                                        kcl_version: program.kcl_version,
+                                        ast: crate::parsing::ast::types::Node::no_src(
+                                            crate::parsing::ast::types::Program::default(),
+                                        ),
+                                        original_file_contents: program.original_file_contents,
+                                    },
+                                    None,
+                                    object_ids,
                                 )
                             }
                         }
@@ -1819,7 +1902,7 @@ impl ExecutorContext {
                             }
 
                             if reapply_failed {
-                                (true, program, None)
+                                (true, program, None, HashSet::new())
                             } else {
                                 // We need to check our imports to see if they changed.
                                 let mut new_exec_state = ExecState::new(self);
@@ -1861,6 +1944,7 @@ impl ExecutorContext {
                                         original_file_contents: program.original_file_contents,
                                     },
                                     Some((new_universe, new_universe_map, new_exec_state)),
+                                    HashSet::new(),
                                 )
                             }
                         }
@@ -1898,7 +1982,7 @@ impl ExecutorContext {
                                     .map(|outcome| PreparedCachedExecution::Cached(Box::new(outcome)))
                                     .map_err(KclErrorWithOutputs::no_outputs);
                             }
-                            (true, program, None)
+                            (true, program, None, HashSet::new())
                         }
                         CacheResult::NoAction(false) => {
                             self.cache
@@ -1945,6 +2029,10 @@ impl ExecutorContext {
                             exec_state
                                 .mut_stack()
                                 .restore_env(cached_state.main.result_env)
+                                .map_err(KclErrorWithOutputs::no_outputs)?;
+
+                            self.send_remove_scene_objects(&mut exec_state, object_ids_to_remove, Default::default())
+                                .await
                                 .map_err(KclErrorWithOutputs::no_outputs)?;
 
                             (exec_state, None, PreserveMem::Always)
