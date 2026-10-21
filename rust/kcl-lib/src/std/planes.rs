@@ -227,11 +227,47 @@ async fn inner_offset_plane(
 // Engine-side effectful creation of an actual plane object.
 // offset planes are shown by default, and hidden by default if they
 // are used as a sketch plane. That hiding command is sent within create_sketch.
+//
+// Spike (see `execution::command_cache`): `MakePlane`'s and `PlaneSetColor`'s
+// ids are decided content-addressed, not via a plain `exec_state.next_uuid()`
+// - see the module docs on `command_cache` for why this matters (deleting
+// something that merely moved in the file shouldn't force a real resend of
+// everything unaffected by the edit). `plane.id`/`plane.artifact_id` are
+// placeholders from the caller until this decides the real one and
+// overwrites them, mirroring `ensure_sketch_plane_in_engine`'s existing
+// pattern of deciding a plane's real id late, right before it's needed.
 async fn make_offset_plane_in_engine(
     plane: &mut Plane,
     exec_state: &mut ExecState,
     args: &Args,
 ) -> Result<(), KclError> {
+    // Create new default planes.
+    let default_size = 100.0;
+    let color = Color::from_rgba(0.6, 0.6, 0.6, 0.3);
+
+    let make_plane_cmd = mcmd::MakePlane::builder()
+        .clobber(false)
+        .origin(plane.info.origin.into())
+        .size(LengthUnit(default_size))
+        .x_axis(plane.info.x_axis.into())
+        .y_axis(plane.info.y_axis.into())
+        .hide(false)
+        .build();
+    let make_plane_content_id =
+        crate::execution::command_cache::content_id_from_bytes(&serde_json::to_vec(&make_plane_cmd).map_err(|e| {
+            KclError::new_internal(KclErrorDetails::new(
+                format!("failed to serialize MakePlane for content hashing: {e}"),
+                vec![args.source_range],
+            ))
+        })?);
+    let (real_id, make_plane_is_hit) = args
+        .ctx
+        .cache
+        .id_for_content(make_plane_content_id, || exec_state.next_uuid())
+        .await;
+    plane.id = real_id;
+    plane.artifact_id = real_id.into();
+
     let plane_object_id = exec_state.next_object_id();
     let plane_object = kcl_api::Object {
         id: plane_object_id,
@@ -243,36 +279,51 @@ async fn make_offset_plane_in_engine(
     };
     exec_state.add_scene_object(plane_object, args.source_range);
 
-    // Create new default planes.
-    let default_size = 100.0;
-    let color = Color::from_rgba(0.6, 0.6, 0.6, 0.3);
-
-    let meta = ModelingCmdMeta::from_args_id(exec_state, args, plane.id);
-    exec_state
-        .batch_modeling_cmd(
-            meta,
-            ModelingCmd::from(
-                mcmd::MakePlane::builder()
-                    .clobber(false)
-                    .origin(plane.info.origin.into())
-                    .size(LengthUnit(default_size))
-                    .x_axis(plane.info.x_axis.into())
-                    .y_axis(plane.info.y_axis.into())
-                    .hide(false)
-                    .build(),
-            ),
-        )
-        .await?;
+    if !make_plane_is_hit {
+        let meta = ModelingCmdMeta::with_id(exec_state, &args.ctx, args.source_range, real_id);
+        exec_state
+            .batch_modeling_cmd(meta, ModelingCmd::from(make_plane_cmd))
+            .await?;
+    }
 
     // Set the color.
     // PlaneSetColor is blocked on CPU engines until https://github.com/KittyCAD/engine/pull/5127 or similar is merged
     if !exec_state.geometry_only() {
-        exec_state
-            .batch_modeling_cmd(
-                ModelingCmdMeta::from_args(exec_state, args),
-                ModelingCmd::from(mcmd::PlaneSetColor::builder().color(color).plane_id(plane.id).build()),
-            )
-            .await?;
+        // `plane_id` must be hashed as the plane's *content* id, not its
+        // real id - the real id is only stable for this run; the content
+        // id is what lets this match a previous run's `PlaneSetColor` even
+        // if `plane.id` shifted (see the module docs on `command_cache`).
+        let plane_content_id = args
+            .ctx
+            .cache
+            .content_id_of(plane.id)
+            .await
+            .expect("just recorded by id_for_content above");
+        let set_color_content_id = crate::execution::command_cache::content_id_from_bytes(
+            &[
+                serde_json::to_vec(&color).map_err(|e| {
+                    KclError::new_internal(KclErrorDetails::new(
+                        format!("failed to serialize color for content hashing: {e}"),
+                        vec![args.source_range],
+                    ))
+                })?,
+                plane_content_id.to_vec(),
+            ]
+            .concat(),
+        );
+        let (_, set_color_is_hit) = args
+            .ctx
+            .cache
+            .id_for_content(set_color_content_id, || exec_state.next_uuid())
+            .await;
+        if !set_color_is_hit {
+            exec_state
+                .batch_modeling_cmd(
+                    ModelingCmdMeta::from_args(exec_state, args),
+                    ModelingCmd::from(mcmd::PlaneSetColor::builder().color(color).plane_id(plane.id).build()),
+                )
+                .await?;
+        }
     }
 
     // Though offset planes might be derived from standard planes, they are

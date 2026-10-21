@@ -118,6 +118,7 @@ pub(crate) enum MatchDecision {
 /// The previous run's ordered command log, with an index for matching new
 /// content ids against it in O(1) instead of scanning. See the module docs
 /// for the matching algorithm.
+#[derive(Debug)]
 pub(crate) struct CommandLog<Payload> {
     entries: Vec<LogEntry<Payload>>,
     /// For each content id, the ascending queue of positions in `entries`
@@ -215,6 +216,70 @@ impl<Payload> CommandLog<Payload> {
         if queue.is_empty() {
             self.index.remove(&content_id);
         }
+    }
+}
+
+/// Spike: accumulates one real run's content-addressed id decisions, both to
+/// make this run's own decisions (via [`Self::content_id_of`], for
+/// substituting an already-decided id's content identity into a later
+/// command that references it) and to become the next run's [`CommandLog`]
+/// (via [`Self::into_log`]).
+///
+/// This specializes [`CommandLog`]'s payload to `uuid::Uuid`: for this
+/// spike, all that needs to survive between runs for each logged command is
+/// the real engine id it was (or would have been) sent with.
+#[derive(Debug, Default)]
+pub(crate) struct CommandCacheRound {
+    entries: Vec<LogEntry<uuid::Uuid>>,
+    id_map: HashMap<uuid::Uuid, ContentId>,
+    pub(crate) hits: usize,
+    pub(crate) misses: usize,
+}
+
+impl CommandCacheRound {
+    /// Decide the real id for a new entity whose command content hashes to
+    /// `content_id`: reuse an old real id (a hit - the caller must skip
+    /// sending) if `old_log`'s match finds one, or mint fresh via
+    /// `mint_fresh` (a miss - the caller must send for real) otherwise.
+    /// Either way, record the decision so later calls this run can look up
+    /// this real id's content id (see [`Self::content_id_of`]), and so it
+    /// becomes part of the log the next run matches against.
+    pub(crate) fn id_for_content(
+        &mut self,
+        old_log: Option<&mut CommandLog<uuid::Uuid>>,
+        content_id: ContentId,
+        mint_fresh: impl FnOnce() -> uuid::Uuid,
+    ) -> (uuid::Uuid, bool) {
+        let (real_id, is_hit) = match old_log {
+            Some(log) => match log.match_next(content_id) {
+                MatchDecision::Hit { old_index, .. } => (*log.payload(old_index), true),
+                MatchDecision::Miss { .. } => (mint_fresh(), false),
+            },
+            None => (mint_fresh(), false),
+        };
+        self.record(content_id, real_id);
+        (real_id, is_hit)
+    }
+
+    /// Look up a previously-decided real id's content id, for substituting
+    /// into a later command's own content hash (see the module docs on why
+    /// a raw real id must never be hashed directly).
+    pub(crate) fn content_id_of(&self, real_id: uuid::Uuid) -> Option<ContentId> {
+        self.id_map.get(&real_id).copied()
+    }
+
+    fn record(&mut self, content_id: ContentId, real_id: uuid::Uuid) {
+        self.entries.push(LogEntry {
+            content_id,
+            payload: real_id,
+        });
+        self.id_map.insert(real_id, content_id);
+    }
+
+    /// Finalize this run's decisions into the log the next run will match
+    /// against.
+    pub(crate) fn into_log(self) -> CommandLog<uuid::Uuid> {
+        CommandLog::new(self.entries)
     }
 }
 

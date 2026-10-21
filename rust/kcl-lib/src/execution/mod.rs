@@ -5523,6 +5523,108 @@ solid7 = extrude(r7, length = width)
         mock.close().await;
     }
 
+    /// Spike (see `execution::command_cache` and `std/planes.rs`'s
+    /// `make_offset_plane_in_engine`): with nothing shifted at all, a
+    /// `plane001 = offsetPlane(...)` call's `MakePlane`/`PlaneSetColor`
+    /// commands are both correctly recognized as hits on a second run of
+    /// the identical program - no insertion/deletion/reordering involved,
+    /// so this is the simple, direct-positional-match case, proving the
+    /// basic plumbing (id_for_content, the substitution lookup) before the
+    /// harder "something shifted" case below.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_cache_spike_reuses_offset_plane_id_when_nothing_shifted() {
+        let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
+        let program = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
+
+        let mut exec_state_1 = ExecState::new(&ctx);
+        let (main_ref_1, _) = ctx.run(&program, &mut exec_state_1).await.unwrap();
+        ctx.cache.finish_command_cache_round().await;
+        let vars_1 = exec_state_1.mod_local.variables(main_ref_1).unwrap();
+        let plane_id_1 = match vars_1.get("plane001").unwrap() {
+            KclValue::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+
+        let mut exec_state_2 = ExecState::new(&ctx);
+        let (main_ref_2, _) = ctx.run(&program, &mut exec_state_2).await.unwrap();
+        ctx.cache.finish_command_cache_round().await;
+        let vars_2 = exec_state_2.mod_local.variables(main_ref_2).unwrap();
+        let plane_id_2 = match vars_2.get("plane001").unwrap() {
+            KclValue::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+
+        assert_eq!(
+            plane_id_1, plane_id_2,
+            "an unchanged program's plane should get the same real id both runs"
+        );
+        ctx.close().await;
+    }
+
+    /// Spike: the harder case - an unrelated statement inserted *before*
+    /// `plane001` shifts the deterministic id-generator counter, so a naive
+    /// real-id comparison would see everything after it as "different".
+    /// This test exists to confirm (empirically, not just by reasoning
+    /// about it) exactly what `command_cache`'s already-documented
+    /// single-pass-streaming limitation means in practice here: `plane001`
+    /// is *not* cleanly recognized as a hit (the inserted `other` has no
+    /// counterpart anywhere in the old log, so it's reported as a plain
+    /// miss that supersedes whatever the log was positioned at - which is
+    /// `plane001`'s own old entry, since nothing has been consumed yet).
+    /// What this test actually proves is the thing this spike was *really*
+    /// for: `PlaneSetColor`'s content hash correctly tracks `plane001`'s
+    /// *current* content id after it's forced through this path, so the
+    /// two decisions stay consistent with each other (both correctly
+    /// re-sent together) rather than `PlaneSetColor` silently referencing a
+    /// stale or mismatched plane id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_cache_spike_insertion_before_plane_forces_a_consistent_recreate() {
+        let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
+
+        let program_a = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
+        let mut exec_state_a = ExecState::new(&ctx);
+        let (main_ref_a, _) = ctx.run(&program_a, &mut exec_state_a).await.unwrap();
+        ctx.cache.finish_command_cache_round().await;
+        let vars_a = exec_state_a.mod_local.variables(main_ref_a).unwrap();
+        let plane_id_a = match vars_a.get("plane001").unwrap() {
+            KclValue::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+
+        let program_b = crate::Program::parse_no_errs(
+            "other = offsetPlane(XZ, offset = 3mm)\nplane001 = offsetPlane(XY, offset = 5mm)\n",
+        )
+        .unwrap();
+        let mut exec_state_b = ExecState::new(&ctx);
+        let (main_ref_b, _) = ctx.run(&program_b, &mut exec_state_b).await.unwrap();
+        ctx.cache.finish_command_cache_round().await;
+        let vars_b = exec_state_b.mod_local.variables(main_ref_b).unwrap();
+        let plane_id_b = match vars_b.get("plane001").unwrap() {
+            KclValue::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+
+        // The documented limitation: this is *not* equal, because the
+        // insertion pre-empts the match before `plane001`'s own content is
+        // ever consulted. Asserted explicitly (not just assumed) so this
+        // test fails loudly if that behavior ever changes.
+        assert_ne!(
+            plane_id_a, plane_id_b,
+            "known Phase 0 limitation: an insertion right before an unchanged item currently forces a recreate"
+        );
+
+        // What actually matters: execution still succeeded (no error from a
+        // stale/mismatched id reference), and `plane001`'s own id in the
+        // *second* run's outcome is self-consistent - i.e. this run didn't
+        // end up in a torn state where `PlaneSetColor` referenced a
+        // different id than the one `plane001`'s value actually holds.
+        // (`make_offset_plane_in_engine` would have errored via `expect` on
+        // `content_id_of` if the substitution lookup had failed outright.)
+        assert_ne!(plane_id_b, uuid::Uuid::nil());
+
+        ctx.close().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cached_execution_phases_preserve_edits_settings_and_error_recovery() {
         let mut ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());

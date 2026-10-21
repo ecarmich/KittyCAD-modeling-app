@@ -44,6 +44,16 @@ struct CacheInner {
     pub old_ast: Option<GlobalState>,
     // The last successful run's memory. Not cleared after an unsuccessful run.
     pub prev_memory: Option<SketchModeState>,
+    /// Spike (see `execution::command_cache`): the previous run's
+    /// content-addressed command log, consulted by `Cache::id_for_content`
+    /// to decide whether a command needs sending at all. Not yet written by
+    /// any real execution path - only by the spike's own test, until this
+    /// is wired into `prepare_cached_execution` for real.
+    command_log: Option<crate::execution::command_cache::CommandLog<Uuid>>,
+    /// Spike: this run's content-addressed decisions, being built up as
+    /// `id_for_content` is called; swapped into `command_log` by
+    /// `finish_command_cache_round` at the end of a successful run.
+    current_round: crate::execution::command_cache::CommandCacheRound,
 }
 
 /// Cached execution state for one engine session and its associated mock execution.
@@ -108,6 +118,47 @@ impl Cache {
         self.read_old_memory()
             .await
             .and_then(|memory| memory.stack.get(name, SourceRange::default()).ok())
+    }
+
+    /// Spike (see `execution::command_cache`): decide the real id for a new
+    /// engine entity whose command content hashes to `content_id`. Returns
+    /// `(id, true)` on a hit - the caller must *skip* sending the command
+    /// and reuse `id` - or `(id, false)` on a miss, where `id` comes from
+    /// `mint_fresh` and the caller must send the command for real. Either
+    /// way, the decision is recorded so a later call this run can look up
+    /// this id's content id via `content_id_of`, and so it becomes part of
+    /// the log the *next* run matches against.
+    pub(crate) async fn id_for_content(
+        &self,
+        content_id: crate::execution::command_cache::ContentId,
+        mint_fresh: impl FnOnce() -> Uuid,
+    ) -> (Uuid, bool) {
+        let mut inner = self.0.inner().write().await;
+        let CacheInner {
+            command_log,
+            current_round,
+            ..
+        } = &mut *inner;
+        current_round.id_for_content(command_log.as_mut(), content_id, mint_fresh)
+    }
+
+    /// Spike: look up a previously-decided real id's content id *from this
+    /// run*, for substituting into a later command's own content hash
+    /// instead of hashing the raw, run-to-run-unstable real id directly.
+    pub(crate) async fn content_id_of(&self, real_id: Uuid) -> Option<crate::execution::command_cache::ContentId> {
+        self.0.inner().read().await.current_round.content_id_of(real_id)
+    }
+
+    /// Spike: finalize this run's content-addressed decisions into the log
+    /// the next run will match against, and reset the accumulator. Only
+    /// called by this spike's own tests for now - real callers will call it
+    /// from `finish_cached_execution` once this is wired in for real,
+    /// alongside `write_old_ast`.
+    #[allow(dead_code)]
+    pub(crate) async fn finish_command_cache_round(&self) {
+        let mut inner = self.0.inner().write().await;
+        let round = std::mem::take(&mut inner.current_round);
+        inner.command_log = Some(round.into_log());
     }
 }
 
