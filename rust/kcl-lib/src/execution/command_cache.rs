@@ -68,18 +68,26 @@
 //! makes a pure reorder free (`[a, b, c]` against old `[c, a, b]` hits all
 //! three), which the old algorithm could not do either.
 //!
-//! **What this does *not* fix**: two old entries with *identical* creation
-//! content that have since diverged via a later mutation (e.g. ten
-//! identical `MakePlane`s, exactly one of which later got a `PlaneSetColor`)
-//! are still indistinguishable to this module, because it only ever
-//! compares one command's content at a time - it has no notion of an
-//! entity's accumulated history. Content-identical siblings still pair up
-//! by FIFO queue order within [`CommandLog`]'s index (see the
+//! **What [`CommandLog`] alone does not fix**: two old entries with
+//! *identical* creation content that have since diverged via a later
+//! mutation (e.g. ten identical `MakePlane`s, exactly one of which later
+//! got a `PlaneSetColor`) are still indistinguishable to it, because it
+//! only ever compares one command's content at a time - it has no notion
+//! of an entity's accumulated history. Content-identical siblings pair up
+//! by FIFO queue order within its index (see the
 //! `duplicate_content_pairs_with_earliest_unconsumed_occurrence_first`
 //! test below), which is safe only as long as nothing has actually told
 //! them apart yet.
-//! Fixing that needs per-entity chained content identity, not a change to
-//! this matcher - see the design note's SS3.2 and SS3.5, and its step 3.
+//!
+//! [`EntityChain`] and [`ChainLog`] fix this: content identity becomes a
+//! rolling, per-entity history (a Merkle-style chain), not an independent
+//! hash per command, so two entities that start out identical but later
+//! diverge are matched correctly regardless of position - see
+//! [`match_round`]'s docs and the
+//! `duplicate_content_with_a_divergent_mutation_disambiguates_by_chain_not_position`
+//! test. **Not yet wired into anything real** - see [`match_round`]'s own
+//! doc comment for exactly why generalizing past the two hand-written
+//! call sites in `std/planes.rs` needs more than this module alone.
 
 #![allow(dead_code)]
 
@@ -195,6 +203,196 @@ impl<Payload> CommandLog<Payload> {
         }
         position
     }
+}
+
+/// One entity's accumulated content history: `levels[0]` is its creation
+/// content, and every later element is a subsequent in-place mutation's
+/// content chained onto whatever came before it (a Merkle-style history,
+/// not an independent hash per command). Two entities that start out
+/// identical (same creation content, so the same `levels[0]`) diverge the
+/// moment one of them receives a mutation the other doesn't - which is
+/// exactly the case [`CommandLog`] alone cannot disambiguate (see the
+/// module docs' section on what index-based matching still doesn't fix).
+#[derive(Debug, Clone)]
+pub(crate) struct EntityChain {
+    levels: Vec<ContentId>,
+}
+
+impl EntityChain {
+    /// Start a new chain from an entity's creation content.
+    pub(crate) fn new(creation_content: ContentId) -> Self {
+        Self {
+            levels: vec![creation_content],
+        }
+    }
+
+    /// Roll the chain forward by one in-place mutation.
+    /// `mutation_content` should already have any *other* entity's
+    /// reference fields substituted by *their* current chain content (the
+    /// same rule [`CommandCacheRound::content_id_of`] exists for today) -
+    /// this only threads in *this* entity's own prior history
+    /// automatically.
+    pub(crate) fn extend(&mut self, mutation_content: &[u8]) {
+        let mut bytes = Vec::with_capacity(self.current().len() + mutation_content.len());
+        bytes.extend_from_slice(&self.current());
+        bytes.extend_from_slice(mutation_content);
+        self.levels.push(content_id_from_bytes(&bytes));
+    }
+
+    /// The current (deepest) level - substitute this, not a raw real id,
+    /// when a later command's own content hash references this entity.
+    pub(crate) fn current(&self) -> ContentId {
+        *self
+            .levels
+            .last()
+            .expect("a chain always has at least its creation level")
+    }
+
+    /// How many mutations (not counting creation) this chain has seen so
+    /// far. [`match_round`] resolves deeper chains before shallower ones,
+    /// since depth is exactly what makes a chain more likely to be
+    /// globally unique rather than shared with untouched siblings.
+    pub(crate) fn depth(&self) -> usize {
+        self.levels.len() - 1
+    }
+}
+
+/// The result of matching one entity's [`EntityChain`] against a
+/// [`ChainLog`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainMatch {
+    /// The entity's *entire* chain, through its deepest level, matches an
+    /// old entity's: reuse its payload, and skip sending every command
+    /// that contributed to the chain, not just the latest one.
+    FullHit { old_index: usize },
+    /// Only the first `matched_depth + 1` levels match (`matched_depth ==
+    /// 0` means just the creation level matched); the old entity is still
+    /// the same underlying object to reuse, but whatever this entity's
+    /// chain does beyond `matched_depth` must be (re)sent - e.g. a
+    /// mutation whose *value* changed (red last round, blue this round)
+    /// reuses the base object and resends only that one mutation, instead
+    /// of recreating the whole thing.
+    PartialHit { old_index: usize, matched_depth: usize },
+    /// Not even this chain's creation level matches anything in the old
+    /// log: genuinely new.
+    Miss,
+}
+
+/// The previous round's entity chains, indexed at every level - not just
+/// each entity's deepest one - so a new entity's chain can match an old
+/// one at whatever depth they still agree on; see [`ChainMatch::PartialHit`].
+#[derive(Debug)]
+pub(crate) struct ChainLog<Payload> {
+    entities: Vec<(EntityChain, Payload)>,
+    /// For each level's content id (across every entity, every depth), the
+    /// ascending queue of entity indices that have it *somewhere* in their
+    /// chain. An index can appear in several queues (one per level of its
+    /// own chain); `claimed` - not removal from these queues - is what
+    /// actually prevents an entity from being reused twice, since removing
+    /// a claimed entity from every queue it appears in would cost more
+    /// than just skipping it lazily on the next pop.
+    index: HashMap<ContentId, VecDeque<usize>>,
+    claimed: std::collections::HashSet<usize>,
+}
+
+impl<Payload> ChainLog<Payload> {
+    /// Build a log from the previous round's entities and their full
+    /// chains.
+    pub(crate) fn new(entities: Vec<(EntityChain, Payload)>) -> Self {
+        let mut index: HashMap<ContentId, VecDeque<usize>> = HashMap::new();
+        for (entity_index, (chain, _)) in entities.iter().enumerate() {
+            for &level_content in &chain.levels {
+                index.entry(level_content).or_default().push_back(entity_index);
+            }
+        }
+        Self {
+            entities,
+            index,
+            claimed: Default::default(),
+        }
+    }
+
+    /// The payload at a given old entity index. Only ever called with an
+    /// index a [`ChainMatch`] just returned, so this never needs to handle
+    /// an invalid one.
+    pub(crate) fn payload(&self, old_index: usize) -> &Payload {
+        &self.entities[old_index].1
+    }
+
+    /// Match one entity's chain against this log - deepest level first,
+    /// falling back to shallower levels so a change partway through an
+    /// entity's history still reuses its identity instead of recreating it
+    /// outright. Prefer [`match_round`] over calling this directly for more
+    /// than one entity: matching several entities one at a time in the
+    /// wrong order (shallow before deep) is exactly how a degenerate
+    /// sibling can steal a distinguished entity's one true match.
+    pub(crate) fn match_chain(&mut self, chain: &EntityChain) -> ChainMatch {
+        for depth in (0..chain.levels.len()).rev() {
+            if let Some(old_index) = self.take_earliest_unclaimed(chain.levels[depth]) {
+                self.claimed.insert(old_index);
+                return if depth == chain.levels.len() - 1 {
+                    ChainMatch::FullHit { old_index }
+                } else {
+                    ChainMatch::PartialHit {
+                        old_index,
+                        matched_depth: depth,
+                    }
+                };
+            }
+        }
+        ChainMatch::Miss
+    }
+
+    /// Pop and return the earliest not-yet-claimed entity index with this
+    /// content id at some level, discarding any already-claimed ones found
+    /// along the way (they can never be matched again regardless).
+    fn take_earliest_unclaimed(&mut self, content_id: ContentId) -> Option<usize> {
+        let queue = self.index.get_mut(&content_id)?;
+        while let Some(candidate) = queue.pop_front() {
+            if !self.claimed.contains(&candidate) {
+                if queue.is_empty() {
+                    self.index.remove(&content_id);
+                }
+                return Some(candidate);
+            }
+        }
+        self.index.remove(&content_id);
+        None
+    }
+}
+
+/// Match every entity produced this round against the previous round's
+/// chains in one pass, ordered so entities with a deeper (more specific,
+/// so more likely globally unique) chain are matched before shallower
+/// ones. This is the actual fix for the duplicate-content-with-divergent-
+/// mutation case (see the module docs and this file's
+/// `duplicate_content_with_a_divergent_mutation_...` test): without this
+/// ordering, a degenerate sibling processed first could claim the one old
+/// entity a distinguished entity was actually supposed to reuse, before
+/// the distinguished entity ever got a chance to ask for it.
+///
+/// `new_chains` should be in the order entities were produced this round;
+/// ties (equal depth) keep that relative order, which is what makes
+/// genuinely-interchangeable siblings pair up FIFO rather than arbitrarily,
+/// the same way [`ChainLog::match_chain`] already does within one content
+/// id.
+///
+/// Not yet called from anywhere real: generalizing past the two
+/// hand-written call sites in `std/planes.rs` needs every entity's full
+/// chain to be known *before* any real id is decided, which in turn needs
+/// interpreter ids decoupled from real ids (the design note's SS2) - not
+/// yet implemented, only designed. Calling this against eagerly-decided
+/// real ids, the way `std/planes.rs` decides them today, would reproduce
+/// the exact bug it exists to fix (see the design note's revision to SS3,
+/// "before further implementation").
+pub(crate) fn match_round<Payload>(old: &mut ChainLog<Payload>, new_chains: &[EntityChain]) -> Vec<ChainMatch> {
+    let mut order: Vec<usize> = (0..new_chains.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(new_chains[i].depth()));
+    let mut results = vec![ChainMatch::Miss; new_chains.len()];
+    for i in order {
+        results[i] = old.match_chain(&new_chains[i]);
+    }
+    results
 }
 
 /// Spike: accumulates one real run's content-addressed id decisions, both to
@@ -1001,5 +1199,139 @@ mod tests {
         let _ = log.match_next(id("z")); // miss; "y" (position 1) stays unclaimed
         assert_eq!(log.match_next(id("x")), MatchDecision::Miss);
         assert_eq!(log.superseded(), vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn id(label: &str) -> ContentId {
+        content_id_from_bytes(label.as_bytes())
+    }
+
+    /// Build a chain from a creation label plus zero or more mutation
+    /// labels, applied in order - a test-only stand-in for real content
+    /// bytes, same spirit as `tests::log_of`'s use of plain strings.
+    fn chain_of(levels: &[&str]) -> EntityChain {
+        let mut chain = EntityChain::new(id(levels[0]));
+        for level in &levels[1..] {
+            chain.extend(level.as_bytes());
+        }
+        chain
+    }
+
+    #[test]
+    fn two_chains_with_the_same_creation_content_are_equal_until_one_is_extended() {
+        let a = chain_of(&["plane"]);
+        let b = chain_of(&["plane"]);
+        assert_eq!(a.current(), b.current());
+        let mut b = b;
+        b.extend(b"red");
+        assert_ne!(a.current(), b.current());
+        assert_eq!(a.depth(), 0);
+        assert_eq!(b.depth(), 1);
+    }
+
+    #[test]
+    fn an_unmutated_entity_is_a_full_hit_at_depth_zero() {
+        let mut old = ChainLog::new(vec![(chain_of(&["plane"]), "R1")]);
+        assert_eq!(
+            old.match_chain(&chain_of(&["plane"])),
+            ChainMatch::FullHit { old_index: 0 }
+        );
+    }
+
+    #[test]
+    fn genuinely_new_content_is_a_miss() {
+        let mut old = ChainLog::new(vec![(chain_of(&["plane"]), "R1")]);
+        assert_eq!(old.match_chain(&chain_of(&["sketch"])), ChainMatch::Miss);
+    }
+
+    #[test]
+    fn a_changed_mutation_value_falls_back_to_reusing_the_base_object() {
+        // Colored red last round, blue this round: the deepest level
+        // doesn't match anything, but the creation level still does - so
+        // the base object is reused and only the color needs resending,
+        // not a full recreate.
+        let mut old = ChainLog::new(vec![(chain_of(&["plane", "red"]), "R1")]);
+        assert_eq!(
+            old.match_chain(&chain_of(&["plane", "blue"])),
+            ChainMatch::PartialHit {
+                old_index: 0,
+                matched_depth: 0
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_content_with_a_divergent_mutation_disambiguates_by_chain_not_position() {
+        // The exact scenario that broke independent per-command content
+        // ids: ten identical planes: old entity #6 (0-indexed 5) is the
+        // only one that was ever colored. This is the worked example from
+        // the design note's SS3.1.
+        let old_entities: Vec<(EntityChain, String)> = (0..10)
+            .map(|i| {
+                let chain = if i == 5 {
+                    chain_of(&["plane", "red"])
+                } else {
+                    chain_of(&["plane"])
+                };
+                (chain, format!("R{i}"))
+            })
+            .collect();
+        let mut old = ChainLog::new(old_entities);
+
+        // This round: the same ten planes, but an unrelated edit means the
+        // colored one is no longer in the same position - put it *last*,
+        // nowhere near position 5, to prove position plays no role.
+        let mut new_chains: Vec<EntityChain> = (0..9).map(|_| chain_of(&["plane"])).collect();
+        new_chains.push(chain_of(&["plane", "red"]));
+
+        let results = match_round(&mut old, &new_chains);
+
+        // The colored entity must land on old "R5" specifically (payload
+        // index 5), the one old entity that actually has this history -
+        // not an arbitrary one of the ten, despite arriving last.
+        assert_eq!(results[9], ChainMatch::FullHit { old_index: 5 });
+        assert_eq!(old.payload(5), "R5");
+
+        // Every uncolored new entity gets *some* uncolored old real id -
+        // any one of the remaining nine, but never the colored one, which
+        // is already claimed.
+        for result in &results[..9] {
+            let ChainMatch::FullHit { old_index } = result else {
+                panic!("expected a hit, got {result:?}");
+            };
+            assert_ne!(*old_index, 5, "must never reuse the colored plane for an uncolored one");
+        }
+
+        // And every one of the ten old entities was claimed by exactly one
+        // new entity - no double-claims, nothing left over.
+        let mut claimed: Vec<usize> = results
+            .iter()
+            .map(|r| match r {
+                ChainMatch::FullHit { old_index } => *old_index,
+                other => panic!("expected a hit, got {other:?}"),
+            })
+            .collect();
+        claimed.sort_unstable();
+        assert_eq!(claimed, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_claimed_entity_is_never_matched_again_even_at_a_shallower_level() {
+        // Regression guard mirroring `tests::a_consumed_position_is_never_matched_again`:
+        // once an entity has been claimed via its deepest level, it must
+        // not resurface as a candidate for a *different* new entity that
+        // only reaches its shallower (creation) level.
+        let mut old = ChainLog::new(vec![(chain_of(&["plane", "red"]), "R1")]);
+        assert_eq!(
+            old.match_chain(&chain_of(&["plane", "red"])),
+            ChainMatch::FullHit { old_index: 0 }
+        );
+        // A second, unrelated entity that only matches at the creation
+        // level must not be handed the already-claimed old entity.
+        assert_eq!(old.match_chain(&chain_of(&["plane"])), ChainMatch::Miss);
     }
 }

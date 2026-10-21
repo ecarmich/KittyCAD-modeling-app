@@ -232,34 +232,58 @@ Two entities that start identical (same creation content) but have since
 received different mutations now have different chain values, full stop —
 no position reasoning needed to tell them apart once they've diverged.
 
-**Matching procedure, most-specific first:** within the set of entities being
-matched, resolve entities with a longer (more mutated, hence more likely
-globally unique) chain before entities whose chain is still at the bare
-creation level. For each, look up its current chain value in the old log's
-chain index; on a hit, consume that old entry (removing it from every
-shallower level's pool too, since a deeper match implies the shallower
-levels along the same chain are also accounted for). Once every
-distinguishable entity is resolved this way, whatever's left on both sides
-is, by construction, mutually indistinguishable — pair the remainder in any
-fixed order (position is a perfectly fine, *safe* tie-break here, because
-nothing in either round's history ever told them apart).
+**Matching procedure, most-specific first — implemented.** `EntityChain`,
+`ChainLog`, `ChainMatch`, and `match_round` all exist now in
+`command_cache.rs`, standalone and tested, same scoping as everything else
+in this module (nothing calls into them yet — see the caveat below on why
+not). Within the set of entities being matched, `match_round` resolves
+entities with a longer (more mutated, hence more likely globally unique)
+chain before entities whose chain is still at the bare creation level. For
+each, `ChainLog::match_chain` looks up its current chain value — falling
+back to shallower levels if the deepest doesn't match — against the old
+log's index; on a hit, the whole old entity is claimed (every level of its
+history, not just the matched one), so it can never be handed to a
+different new entity afterward. Once every distinguishable entity is
+resolved this way, whatever's left on both sides is, by construction,
+mutually indistinguishable — pairing the remainder in any fixed order is
+safe, because nothing in either round's history ever told them apart.
 
-Re-run on the worked example: this round has one entity with chain
-`[C, hash(C, color)]` and nine with chain `[C]`; so does the old log. The
-2-level chain resolves first, by direct hashmap lookup, regardless of
-position — finds the *one* old entity that ever had that exact history,
-reuses its real id correctly. That consumes one `C` from the degenerate pool
-on both sides. The remaining nine-against-nine, truly fungible, get paired
-arbitrarily — safely, this time, because the one entity that actually
-mattered was already resolved first.
+Verified against the worked example directly: the
+`duplicate_content_with_a_divergent_mutation_disambiguates_by_chain_not_position`
+test builds ten old entities (one with a `["plane", "red"]` chain, nine with
+bare `["plane"]`), moves the colored one to a different position in the new
+round's sequence (nowhere near where it was), and asserts `match_round`
+still resolves it to the correct old entity specifically — never one of the
+nine uncolored ones — while the nine genuinely-interchangeable siblings
+pair up with whatever's left, and every one of the ten claims exactly one
+old entity (no double-claims, nothing orphaned).
 
 This also recovers the mechanism's original purpose for the case where a
-mutation's *value* changes rather than its presence: if plane #6 is colored
-red last round and blue this round, the deepest chain level misses (no old
-entity has `hash(C, blue)`), so matching falls back to the shallower,
-creation-only level (`C`, which still matches plenty of old entities) and
-reuses the plane while resending only the changed `PlaneSetColor` — not a
-full recreate.
+mutation's *value* changes rather than its presence: the
+`a_changed_mutation_value_falls_back_to_reusing_the_base_object` test
+confirms that a plane colored red last round and blue this round produces
+`ChainMatch::PartialHit { matched_depth: 0 }` — the deepest level misses (no
+old entity has `hash(C, blue)`), so matching falls back to the shallower,
+creation-only level (`C`, which still matches), reusing the plane while
+leaving only the changed `PlaneSetColor` needing to be resent, not a full
+recreate.
+
+**Discovered while implementing, not anticipated when this section was
+first written:** generalizing past the two hand-written call sites in
+`std/planes.rs` is *not* safe yet, and `match_round` is deliberately left
+unwired rather than papering over this. The chain-based fix requires every
+entity's *complete* chain (including mutations that come *later* in program
+order, like `PlaneSetColor` after `MakePlane`) to be known before any real
+id is decided — otherwise the `MakePlane` step still has to decide eagerly,
+exactly as `std/planes.rs` does today, and the bug reproduces identically
+regardless of how good the matcher is. That requires interpreter ids
+decoupled from real ids (§2) to be actually *implemented*, not merely
+designed — real ids deferred until enough of the round is known to rank
+entities by chain depth first. Until §2 lands in code, `std/planes.rs`'s
+existing two call sites should stay exactly as they are; replacing them with
+something that merely *looks* generalized while still deciding eagerly would
+be worse than not touching them, since it would silently reintroduce this
+section's own bug under a more convincing-looking abstraction.
 
 **Caveat, not yet resolved:** classifying a command as *creates* / *mutates
 an existing entity in place* / *pure query* is a third dimension on top of
@@ -459,14 +483,23 @@ types before implementation, not assumed from this doc.
    `duplicate_content_pairs_with_earliest_unconsumed_occurrence_first`
    stays green but its doc comment now points at what it *doesn't* cover
    (divergent mutation among duplicates - step 3's job).
-3. Entity-chained content identity (§3.2) and the duplicate-content test from
-   §3.5, generalizing the before-send path (today: `MakePlane`/
-   `PlaneSetColor` only, by hand) to use `IdRefs` + the effect classification
-   instead of the two hand-written call sites in `std/planes.rs`.
-4. Output-boundary rewrite (§5) only once something upstream actually
-   produces interpreter-id-addressed values that need it — no point building
-   the translation pass before there's anything to translate.
-5. Response caching (§4): separate follow-up, not a prerequisite for 1-4.
+3. **Partly done.** Entity-chained content identity (`EntityChain`,
+   `ChainLog`, `ChainMatch`, `match_round`) and the duplicate-content test
+   from §3.5 are implemented and passing in `command_cache.rs`, standalone.
+   **Not done, and now known not to be safe yet:** generalizing the
+   before-send path to replace the two hand-written call sites in
+   `std/planes.rs`. That turns out to need real ids deferred until a whole
+   round's chains are known — i.e. §2's split actually implemented in code,
+   not just designed — which this step did not anticipate going in. Revisit
+   `std/planes.rs` only after §2 exists for real; see §3.2's "discovered
+   while implementing" note.
+4. §2's interpreter-id/real-id split, for real — newly promoted ahead of
+   output-boundary work by step 3's finding above: it's not just needed for
+   `ExecOutcome`/the artifact graph (§5), it's the actual blocker on using
+   the chain matcher for anything beyond its own standalone tests.
+5. Output-boundary rewrite (§5) once §2 exists and something upstream
+   actually produces interpreter-id-addressed values that need it.
+6. Response caching (§4): separate follow-up, not a prerequisite for 1-5.
 
 Each step should land as its own reviewable commit with its own tests, same
 as the three commits already on this branch — this doc is deliberately not
