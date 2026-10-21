@@ -164,6 +164,7 @@ mod artifact;
 pub(crate) use artifact::mermaid_tests::ArtifactGraphMermaidExt;
 pub(crate) mod cache;
 mod cad_op;
+pub(crate) mod command_cache;
 pub(crate) mod exec_ast;
 pub mod fn_call;
 #[cfg(test)]
