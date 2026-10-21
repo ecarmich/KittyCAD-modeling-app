@@ -281,15 +281,19 @@ for anything beyond the send-reduction the cache already exists to do.
 
 Checked against the installed `kittycad-modeling-cmds = 0.2.250` crate
 (`define_modeling_cmd_enum!` in `def_enum.rs`, which generates `ModelingCmd`'s
-163 variants): **106 of the 163 variants** declare at least one field typed
-`Uuid`, `Option<Uuid>`, `Vec<Uuid>`, `ModelingCmdId`, or `Option<ModelingCmdId>`.
+167 variants, confirmed by brace-depth-aware parsing of `def_enum.rs` rather
+than a line-oriented grep — the first pass undercounted at 163): **110 of
+the 167 variants** declare at least one field typed `Uuid`, `Option<Uuid>`,
+`Vec<Uuid>`, `Option<Vec<Uuid>>`, `ModelingCmdId`, or `Option<ModelingCmdId>`.
 That is the real size of the "declare once per command type" surface — more
 than double the ~20-40 guessed before looking, and a reminder that the number
 needs re-confirming against the actual crate version in use whenever this is
-implemented, not assumed from memory.
+implemented, not assumed from memory. The full, mechanically-derived list is
+implemented as `IdRefs` in `command_cache.rs` (see §3.4) rather than
+hand-maintained here.
 
-Representative, individually verified entries (full list needs a dedicated
-audit pass, see §3.5):
+Representative, individually verified entries (full list is now in
+`command_cache.rs`'s `impl IdRefs for ModelingCmd`, not just this table):
 
 | Variant | id-reference fields | notes |
 |---|---|---|
@@ -312,52 +316,58 @@ declaration, once, not per call site. That one-time cost is the actual "fewer
 places to change" win the task description was pointing at (vs. 146 existing
 `next_uuid()` call sites across `src/`, counted directly in this repo).
 
-### 3.4 The declaration itself
+### 3.4 The declaration itself — implemented
+
+This is no longer just designed: `IdRefs`, its `impl for ModelingCmd` (110
+match arms, mechanically derived from `def_enum.rs` as described in §3.3),
+and the `EntityIdentity`/`CommandEffect` classification enums all exist now
+in `command_cache.rs`, with unit tests (`id_refs_tests`) covering each field
+shape (bare `Uuid`, `ModelingCmdId`, `Vec<Uuid>`, `Option<Vec<Uuid>>`,
+multi-field variants, and the no-op default). Still nothing calls any of it
+— same "prove the piece in isolation" scoping as the rest of this module.
 
 ```rust
-/// Declared once per `ModelingCmd` variant (see the per-variant audit in
-/// `command_cache::id_refs`): every `Uuid`-shaped field that is a reference
-/// to another entity's interpreter id, as opposed to a value that merely
-/// happens to be shaped like a `Uuid`.
-trait IdRefs {
-    /// Call `visit` once for every id-reference field this command variant
-    /// carries. A no-op default covers the majority of variants that
-    /// reference nothing.
+pub(crate) trait IdRefs {
     fn for_each_id_ref_mut(&mut self, visit: &mut dyn FnMut(&mut Uuid)) {}
 }
 ```
 
-Implemented as a single `match` over `ModelingCmd` in
-`command_cache.rs` (the trait is local, so `impl IdRefs for ModelingCmd` is a
-normal inherent-looking impl despite `ModelingCmd` being a foreign type —
-no newtype needed). One `match` arm per one of the 106 variants that has at
-least one reference field; everything else falls through to the default.
+(The trait is local, so `impl IdRefs for ModelingCmd` is a normal
+inherent-looking impl despite `ModelingCmd` being a foreign type — no
+newtype needed.)
 
-Separately, per §3.2, declare each variant's role along two axes, not one:
+Per §3.2, a command's role is classified along two further axes, not just
+id-references — also implemented now, but only for a **representative
+subset**, deliberately not the full 167:
 
-- **Identity**: does its own cmd_id *own* a persistent entity (`MakePlane`,
-  by inspection also e.g. `Extrude`'s created solid), is it a pure
-  correlation token thrown away after the response (every query), or both
-  at once for part of its output (`Solid3dFilletEdge`)?
-- **Effect**: does it *create* a new entity, *mutate* an existing one in
-  place (extending that entity's chain per §3.2), or *query* (read-only,
-  extends nothing)? A command can be more than one of these simultaneously.
+- **Identity** (`EntityIdentity`): does its own cmd_id *own* a persistent
+  entity (`MakePlane`), or is it a disposable correlation token (every
+  query-style command already wired into `std/` today — see §1's list)?
+- **Effect** (`CommandEffect`): does it *create*, *mutate in place*
+  (`PlaneSetColor`), *query*, or both at once (`Solid3dFilletEdge`,
+  `MutatesAndCreates`)?
 
-Neither axis is derivable from `ModelingCmdId` vs. `Uuid` typing alone, so
-both need the same kind of one-time, human-reviewed table as `IdRefs`,
-likely co-located with it.
+`entity_identity`/`command_effect` return `Option`, and `None` means "not
+yet classified," not "doesn't apply" — intentionally, since neither axis is
+derivable from `ModelingCmdId` vs. `Uuid` typing, and guessing the rest for
+167 variants without the engine's own docs would be fabricating semantics,
+not designing. Widening these two tables is step 3's job (§6), gated on the
+duplicate-content test below existing first.
 
-### 3.5 Before implementing
+### 3.5 Before further implementation
 
-- Re-derive the 106-variant list mechanically (don't hand-maintain it from
-  this doc) against whatever `kittycad-modeling-cmds` version is pinned at
-  implementation time, and confirm each reference field's semantics against
-  the engine's own command docs, not just its field name — a few of the
-  `Uuid` fields found (e.g. `CreateRegion`'s `segment`/`intersection_segment`)
-  read as transient/computed rather than referencing a cacheable persistent
-  entity, and need a real answer, not a guess, before being included.
-- Confirm the identity and effect classification (§3.4) per variant against
-  engine behavior, not naming convention alone.
+- The 110-variant `IdRefs` list is mechanically derived and in the code now
+  (not hand-maintained in this doc) — but still needs re-deriving if
+  `kittycad-modeling-cmds` is upgraded, and the handful of fields flagged
+  uncertain (`CreateRegion`'s `segment`/`intersection_segment` — included
+  conservatively, since treating a real reference as inert is the dangerous
+  direction) still need confirming against the engine's own command docs,
+  not just field names.
+- `entity_identity`/`command_effect` cover only `MakePlane`, `PlaneSetColor`,
+  the Boolean family, `Solid3dFilletEdge`, and the query-style commands
+  already listed in §1 — confirm each against actual engine behavior before
+  relying on it, and before adding more entries from naming convention
+  alone.
 - Write the duplicate-content-with-divergent-mutation scenario (§3.1) as an
   actual test *before* generalizing past `MakePlane`/`PlaneSetColor` — it is
   the sharpest known failure mode and should gate any further widening of
@@ -433,9 +443,9 @@ types before implementation, not assumed from this doc.
 
 ## 6. Suggested implementation order
 
-1. `IdRefs` trait + the per-variant match (§3.4), tested standalone against
-   synthetic `ModelingCmd` values — no wiring into execution yet, same spirit
-   as `command_cache.rs`'s own introduction.
+1. **Done.** `IdRefs` trait + the per-variant match (§3.4), tested standalone
+   against synthetic `ModelingCmd` values — no wiring into execution yet,
+   same spirit as `command_cache.rs`'s own introduction.
 2. The corrected matcher (§3.2): index-based hit/miss, exclusion-based
    supersession, no entity chaining yet — tested against the original
    insertion/reordering cases (including the already-existing

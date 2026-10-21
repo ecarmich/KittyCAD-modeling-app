@@ -72,6 +72,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
+use kittycad_modeling_cmds::ModelingCmd;
 use sha2::Digest as _;
 use sha2::Sha256;
 
@@ -280,6 +281,584 @@ impl CommandCacheRound {
     /// against.
     pub(crate) fn into_log(self) -> CommandLog<uuid::Uuid> {
         CommandLog::new(self.entries)
+    }
+}
+
+/// Declared once per `ModelingCmd` variant: every `Uuid`-shaped field that
+/// is a reference to another entity's interpreter id, as opposed to a
+/// value that merely happens to be shaped like a `Uuid` (a color, a
+/// session token, ...). See the design note
+/// (`.claude/plans/command-cache-batch-architecture.md`, SS3.3-3.4) for why
+/// this has to be declared once per command *type* here, rather than
+/// derived from field types (most reference fields are plain `Uuid`,
+/// indistinguishable by type from an incidental one) or handled at each of
+/// the ~150 call sites that construct a `ModelingCmd`.
+pub(crate) trait IdRefs {
+    /// Call `visit` once for every id-reference field this command variant
+    /// carries, with a mutable reference so a translator (not built yet -
+    /// this trait is standalone and unwired, same as the rest of this
+    /// module) can overwrite it in place. The default covers every variant
+    /// with no such field.
+    fn for_each_id_ref_mut(&mut self, visit: &mut dyn FnMut(&mut uuid::Uuid)) {
+        let _ = visit;
+    }
+}
+
+impl IdRefs for ModelingCmd {
+    /// One match arm per variant that has at least one id-reference field,
+    /// derived mechanically from `kittycad-modeling-cmds = "0.2.250"`'s
+    /// `def_enum.rs` (167 total `ModelingCmd` variants; 110 carry a
+    /// `Uuid`/`Option<Uuid>`/`Vec<Uuid>`/`Option<Vec<Uuid>>`/
+    /// `ModelingCmdId`/`Option<ModelingCmdId>` field). Every other variant
+    /// falls through to the trait's no-op default.
+    ///
+    /// Re-derive this list mechanically against whatever crate version is
+    /// pinned when this is actually wired in - don't hand-maintain it by
+    /// eye - and confirm each field's semantics against the engine's own
+    /// command docs, not just its name, before relying on it. `CreateRegion`'s
+    /// `segment`/`intersection_segment` below are included because treating
+    /// a real reference as inert is the dangerous direction (it would hash
+    /// a run-to-run-unstable real id into a content id and break matching
+    /// silently), but their exact semantics haven't been confirmed against
+    /// engine docs - see SS3.5.
+    fn for_each_id_ref_mut(&mut self, visit: &mut dyn FnMut(&mut uuid::Uuid)) {
+        match self {
+            ModelingCmd::MovePathPen(c) => visit(&mut c.path.0),
+            ModelingCmd::ExtendPath(c) => visit(&mut c.path.0),
+            ModelingCmd::Extrude(c) => {
+                if let Some(id) = &mut c.target {
+                    visit(&mut id.0);
+                }
+            }
+            ModelingCmd::ExtrudeToReference(c) => {
+                if let Some(id) = &mut c.target {
+                    visit(&mut id.0);
+                }
+            }
+            ModelingCmd::TwistExtrude(c) => visit(&mut c.target.0),
+            ModelingCmd::Sweep(c) => {
+                visit(&mut c.target.0);
+                visit(&mut c.trajectory.0);
+            }
+            ModelingCmd::Revolve(c) => visit(&mut c.target.0),
+            ModelingCmd::Solid3dShellFace(c) => {
+                visit(&mut c.object_id);
+                for id in &mut c.face_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Solid3dJoin(c) => visit(&mut c.object_id),
+            ModelingCmd::Solid3dMultiJoin(c) => {
+                for id in &mut c.object_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Solid3dGetEdgeUuid(c) => visit(&mut c.object_id),
+            ModelingCmd::Solid3dGetFaceUuid(c) => visit(&mut c.object_id),
+            ModelingCmd::Solid3dGetBodyType(c) => visit(&mut c.object_id),
+            ModelingCmd::RevolveAboutEdge(c) => {
+                visit(&mut c.target.0);
+                if let Some(id) = &mut c.edge_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Loft(c) => {
+                for id in &mut c.section_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::ClosePath(c) => visit(&mut c.path_id),
+            ModelingCmd::Export2d(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Export3d(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Export(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::EntityGetParentId(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetNumChildren(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetChildUuid(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetIndex(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetPrimitiveIndex(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityDeleteChildren(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetAllChildUuids(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetSketchPaths(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityGetDistance(c) => {
+                visit(&mut c.entity_id1);
+                visit(&mut c.entity_id2);
+            }
+            ModelingCmd::EdgeGetLength(c) => visit(&mut c.edge_id),
+            ModelingCmd::EntityClone(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityLinearPatternTransform(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityLinearPattern(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityCircularPattern(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityMakeHelix(c) => visit(&mut c.cylinder_id),
+            ModelingCmd::EntityMakeHelixFromEdge(c) => {
+                if let Some(id) = &mut c.edge_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::EntityMirrorAcross(c) => {
+                for id in &mut c.ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::EntityMirror(c) => {
+                for id in &mut c.ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::EntityMirrorAcrossEdge(c) => {
+                for id in &mut c.ids {
+                    visit(id);
+                }
+                if let Some(id) = &mut c.edge_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::QueryEntityType(c) => visit(&mut c.entity_id),
+            ModelingCmd::SelectAdd(c) => {
+                for id in &mut c.entities {
+                    visit(id);
+                }
+            }
+            ModelingCmd::SelectRemove(c) => {
+                for id in &mut c.entities {
+                    visit(id);
+                }
+            }
+            ModelingCmd::SelectReplace(c) => {
+                for id in &mut c.entities {
+                    visit(id);
+                }
+            }
+            ModelingCmd::HighlightSetEntities(c) => {
+                for id in &mut c.entities {
+                    visit(id);
+                }
+            }
+            ModelingCmd::UpdateAnnotation(c) => visit(&mut c.annotation_id),
+            ModelingCmd::ObjectVisible(c) => visit(&mut c.object_id),
+            ModelingCmd::ObjectBringToFront(c) => visit(&mut c.object_id),
+            ModelingCmd::ObjectSetMaterialParamsPbr(c) => visit(&mut c.object_id),
+            ModelingCmd::ObjectSetName(c) => visit(&mut c.object_id),
+            ModelingCmd::GetEntityType(c) => visit(&mut c.entity_id),
+            ModelingCmd::Solid3dGetAllEdgeFaces(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.edge_id);
+            }
+            ModelingCmd::Solid3dFlip(c) => visit(&mut c.object_id),
+            ModelingCmd::Solid3dFlipFace(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.face_id);
+            }
+            ModelingCmd::Solid2dAddHole(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.hole_id);
+            }
+            ModelingCmd::Solid3dGetAllOppositeEdges(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.edge_id);
+            }
+            ModelingCmd::Solid3dGetOppositeEdge(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.edge_id);
+                visit(&mut c.face_id);
+            }
+            ModelingCmd::Solid3dGetNextAdjacentEdge(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.edge_id);
+                visit(&mut c.face_id);
+            }
+            ModelingCmd::Solid3dGetPrevAdjacentEdge(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.edge_id);
+                visit(&mut c.face_id);
+            }
+            ModelingCmd::Solid3dGetCommonEdge(c) => visit(&mut c.object_id),
+            ModelingCmd::Solid3dFilletEdge(c) => {
+                visit(&mut c.object_id);
+                if let Some(id) = &mut c.edge_id {
+                    visit(id);
+                }
+                for id in &mut c.edge_ids {
+                    visit(id);
+                }
+                for id in &mut c.extra_face_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Solid3dCutEdgeReferences(c) => {
+                visit(&mut c.object_id);
+                for id in &mut c.extra_face_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Solid3dCutEdges(c) => {
+                visit(&mut c.object_id);
+                for id in &mut c.edge_ids {
+                    visit(id);
+                }
+                for id in &mut c.extra_face_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::FaceIsPlanar(c) => visit(&mut c.object_id),
+            ModelingCmd::FaceGetPosition(c) => visit(&mut c.object_id),
+            ModelingCmd::FaceGetCenter(c) => visit(&mut c.object_id),
+            ModelingCmd::FaceGetGradient(c) => visit(&mut c.object_id),
+            ModelingCmd::SendObject(c) => visit(&mut c.object_id),
+            ModelingCmd::EntitySetOpacity(c) => visit(&mut c.entity_id),
+            ModelingCmd::EntityFade(c) => visit(&mut c.entity_id),
+            ModelingCmd::PlaneSetColor(c) => visit(&mut c.plane_id),
+            ModelingCmd::CurveSetConstraint(c) => visit(&mut c.object_id),
+            ModelingCmd::EnableSketchMode(c) => visit(&mut c.entity_id),
+            ModelingCmd::CurveGetType(c) => visit(&mut c.curve_id),
+            ModelingCmd::CurveGetControlPoints(c) => visit(&mut c.curve_id),
+            ModelingCmd::ProjectEntityToPlane(c) => {
+                if let Some(id) = &mut c.entity_id {
+                    visit(id);
+                }
+                visit(&mut c.plane_id);
+            }
+            ModelingCmd::ProjectPointsToPlane(c) => visit(&mut c.plane_id),
+            ModelingCmd::PathGetInfo(c) => visit(&mut c.path_id),
+            ModelingCmd::PathGetCurveUuidsForVertices(c) => {
+                visit(&mut c.path_id);
+                for id in &mut c.vertex_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::PathGetCurveUuid(c) => visit(&mut c.path_id),
+            ModelingCmd::PathGetVertexUuids(c) => visit(&mut c.path_id),
+            ModelingCmd::PathGetSketchTargetUuid(c) => visit(&mut c.path_id),
+            ModelingCmd::PlaneIntersectAndProject(c) => visit(&mut c.plane_id),
+            ModelingCmd::CurveGetEndPoints(c) => visit(&mut c.curve_id),
+            ModelingCmd::Mass(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Density(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Volume(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::CenterOfMass(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::SurfaceArea(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::PhysicalProperties(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::DefaultCameraFocusOn(c) => visit(&mut c.uuid),
+            ModelingCmd::ZoomToFit(c) => {
+                for id in &mut c.object_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::OrientToFace(c) => visit(&mut c.face_id),
+            ModelingCmd::Solid3dGetExtrusionFaceInfo(c) => {
+                visit(&mut c.object_id);
+                if let Some(id) = &mut c.edge_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::Solid3dGetAdjacencyInfo(c) => {
+                visit(&mut c.object_id);
+                if let Some(id) = &mut c.edge_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::SetObjectTransform(c) => visit(&mut c.object_id),
+            ModelingCmd::BooleanUnion(c) => {
+                for id in &mut c.solid_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::BooleanIntersection(c) => {
+                for id in &mut c.solid_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::BooleanSubtract(c) => {
+                for id in &mut c.target_ids {
+                    visit(id);
+                }
+                for id in &mut c.tool_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::BooleanImprint(c) => {
+                for id in &mut c.body_ids {
+                    visit(id);
+                }
+                if let Some(ids) = &mut c.tool_ids {
+                    for id in ids {
+                        visit(id);
+                    }
+                }
+            }
+            ModelingCmd::MakeOffsetPath(c) => {
+                visit(&mut c.object_id);
+                if let Some(id) = &mut c.face_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::AddHoleFromOffset(c) => visit(&mut c.object_id),
+            ModelingCmd::SetGridReferencePlane(c) => {
+                visit(&mut c.grid_id);
+                visit(&mut c.reference_id);
+            }
+            // `segment`/`intersection_segment`: see this fn's doc comment -
+            // included conservatively, not yet confirmed against engine docs.
+            ModelingCmd::CreateRegion(c) => {
+                visit(&mut c.object_id);
+                visit(&mut c.segment);
+                visit(&mut c.intersection_segment);
+            }
+            ModelingCmd::CreatePlanarSurface(c) => {
+                for id in &mut c.curve_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::RegionGetResolvableIntersectionInfo(c) => visit(&mut c.region_id),
+            ModelingCmd::CreateRegionFromQueryPoint(c) => visit(&mut c.object_id),
+            ModelingCmd::RegionGetQueryPoint(c) => visit(&mut c.region_id),
+            ModelingCmd::BoundingBox(c) => {
+                for id in &mut c.entity_ids {
+                    visit(id);
+                }
+            }
+            ModelingCmd::OffsetSurface(c) => visit(&mut c.surface_id),
+            ModelingCmd::ClosestEdge(c) => {
+                if let Some(id) = &mut c.object_id {
+                    visit(id);
+                }
+            }
+            ModelingCmd::SketchGetInfo(c) => visit(&mut c.path_id.0),
+            // Every other variant has no id-reference field.
+            _ => {}
+        }
+    }
+}
+
+/// Whether a `ModelingCmd` variant's own outgoing id is the lasting
+/// identity of a persistent engine entity - so `Cache::id_for_content`
+/// should decide it before sending, as `MakePlane` already does for the
+/// spike - or a disposable correlation token thrown away once its response
+/// arrives.
+///
+/// Classified for a representative subset only, picked to cover the cases
+/// already traced in the design note: an owning creation command
+/// (`MakePlane`), a mutation that references but doesn't own
+/// (`PlaneSetColor`), and the query-style commands already wired into
+/// `std/` today (`extrude.rs`, `edge.rs`, `csg.rs`, etc. - see SS1 of the
+/// design note). The rest deliberately return `None` rather than a guessed
+/// answer; widening this table needs a real check against engine behavior
+/// per variant (see SS3.5), not inference from naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntityIdentity {
+    OwnsEntity,
+    Correlation,
+}
+
+pub(crate) fn entity_identity(cmd: &ModelingCmd) -> Option<EntityIdentity> {
+    match cmd {
+        ModelingCmd::MakePlane(_) => Some(EntityIdentity::OwnsEntity),
+        ModelingCmd::PlaneSetColor(_)
+        | ModelingCmd::Solid3dGetExtrusionFaceInfo(_)
+        | ModelingCmd::Solid3dGetAdjacencyInfo(_)
+        | ModelingCmd::Solid3dGetAllEdgeFaces(_)
+        | ModelingCmd::Solid3dGetOppositeEdge(_)
+        | ModelingCmd::Solid3dGetNextAdjacentEdge(_)
+        | ModelingCmd::Solid3dGetPrevAdjacentEdge(_)
+        | ModelingCmd::Solid3dGetCommonEdge(_)
+        | ModelingCmd::QueryEntityType(_)
+        | ModelingCmd::BoundingBox(_) => Some(EntityIdentity::Correlation),
+        _ => None,
+    }
+}
+
+/// Whether a `ModelingCmd` variant creates a new entity, mutates an
+/// existing one in place (extending its content-chain per the design
+/// note's SS3.2), is a pure read, or - as with `Solid3dFilletEdge`, which
+/// mutates `object_id` in place *and* introduces new face ids - more than
+/// one of these on the same command. Same representative-subset caveat as
+/// [`EntityIdentity`]/[`entity_identity`]: `None` means not yet classified,
+/// not "doesn't apply."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandEffect {
+    Creates,
+    MutatesInPlace,
+    Query,
+    /// Both at once - see `Solid3dFilletEdge` above.
+    MutatesAndCreates,
+}
+
+pub(crate) fn command_effect(cmd: &ModelingCmd) -> Option<CommandEffect> {
+    match cmd {
+        ModelingCmd::MakePlane(_)
+        | ModelingCmd::BooleanUnion(_)
+        | ModelingCmd::BooleanIntersection(_)
+        | ModelingCmd::BooleanSubtract(_)
+        | ModelingCmd::BooleanImprint(_) => Some(CommandEffect::Creates),
+        ModelingCmd::PlaneSetColor(_) => Some(CommandEffect::MutatesInPlace),
+        ModelingCmd::Solid3dFilletEdge(_) => Some(CommandEffect::MutatesAndCreates),
+        ModelingCmd::Solid3dGetExtrusionFaceInfo(_)
+        | ModelingCmd::Solid3dGetAdjacencyInfo(_)
+        | ModelingCmd::Solid3dGetAllEdgeFaces(_)
+        | ModelingCmd::Solid3dGetOppositeEdge(_)
+        | ModelingCmd::Solid3dGetNextAdjacentEdge(_)
+        | ModelingCmd::Solid3dGetPrevAdjacentEdge(_)
+        | ModelingCmd::Solid3dGetCommonEdge(_)
+        | ModelingCmd::QueryEntityType(_)
+        | ModelingCmd::BoundingBox(_) => Some(CommandEffect::Query),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod id_refs_tests {
+    use kittycad_modeling_cmds::each_cmd::BooleanImprint;
+    use kittycad_modeling_cmds::each_cmd::ClosePath;
+    use kittycad_modeling_cmds::each_cmd::MakePlane;
+    use kittycad_modeling_cmds::each_cmd::PlaneSetColor;
+    use kittycad_modeling_cmds::each_cmd::SelectAdd;
+    use kittycad_modeling_cmds::each_cmd::SketchGetInfo;
+    use kittycad_modeling_cmds::id::ModelingCmdId;
+    use kittycad_modeling_cmds::length_unit::LengthUnit;
+    use kittycad_modeling_cmds::shared::Color;
+    use uuid::Uuid;
+
+    use super::*;
+
+    // Every per-command struct in `kittycad-modeling-cmds` is marked
+    // `#[non_exhaustive]` outside the `unstable_exhaustive` feature, so a
+    // plain struct literal (`MakePlane { .. }`) doesn't compile here - the
+    // crate's own `bon::Builder` derive is the sanctioned constructor, same
+    // as `std/planes.rs`'s real (non-test) usage already relies on.
+
+    fn make_plane_cmd() -> ModelingCmd {
+        ModelingCmd::MakePlane(
+            MakePlane::builder()
+                .clobber(false)
+                .origin(Default::default())
+                .x_axis(Default::default())
+                .y_axis(Default::default())
+                .size(LengthUnit(100.0))
+                .build(),
+        )
+    }
+
+    fn visited(cmd: &mut ModelingCmd) -> Vec<Uuid> {
+        let mut seen = Vec::new();
+        cmd.for_each_id_ref_mut(&mut |id| seen.push(*id));
+        seen
+    }
+
+    #[test]
+    fn a_command_with_no_id_reference_fields_visits_nothing() {
+        let mut cmd = make_plane_cmd();
+        assert_eq!(visited(&mut cmd), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn a_bare_uuid_reference_field_is_visited() {
+        let plane_id = Uuid::new_v4();
+        let mut cmd = ModelingCmd::PlaneSetColor(
+            PlaneSetColor::builder()
+                .plane_id(plane_id)
+                .color(Color::from_rgba(1.0, 0.0, 0.0, 1.0))
+                .build(),
+        );
+        assert_eq!(visited(&mut cmd), vec![plane_id]);
+    }
+
+    #[test]
+    fn a_modeling_cmd_id_reference_field_is_visited_by_its_inner_uuid() {
+        let path_id = Uuid::new_v4();
+        let mut cmd = ModelingCmd::SketchGetInfo(SketchGetInfo::builder().path_id(ModelingCmdId(path_id)).build());
+        assert_eq!(visited(&mut cmd), vec![path_id]);
+    }
+
+    #[test]
+    fn a_vec_uuid_reference_field_visits_every_element_in_order() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut cmd = ModelingCmd::SelectAdd(SelectAdd::builder().entities(vec![a, b]).build());
+        assert_eq!(visited(&mut cmd), vec![a, b]);
+    }
+
+    #[test]
+    fn an_option_vec_uuid_reference_field_is_visited_only_when_present() {
+        let body = Uuid::new_v4();
+        let mut with_tools = ModelingCmd::BooleanImprint(
+            BooleanImprint::builder()
+                .body_ids(vec![body])
+                .tool_ids(vec![Uuid::new_v4()])
+                .separate_bodies(false)
+                .use_legacy(false)
+                .keep_tools(false)
+                .tolerance(LengthUnit(0.01))
+                .build(),
+        );
+        assert_eq!(visited(&mut with_tools).len(), 2);
+
+        let mut without_tools = ModelingCmd::BooleanImprint(
+            BooleanImprint::builder()
+                .body_ids(vec![body])
+                .separate_bodies(false)
+                .use_legacy(false)
+                .keep_tools(false)
+                .tolerance(LengthUnit(0.01))
+                .build(),
+        );
+        assert_eq!(visited(&mut without_tools), vec![body]);
+    }
+
+    #[test]
+    fn visiting_can_overwrite_ids_in_place() {
+        let old_id = Uuid::new_v4();
+        let new_id = Uuid::new_v4();
+        let mut cmd = ModelingCmd::ClosePath(ClosePath::builder().path_id(old_id).build());
+        cmd.for_each_id_ref_mut(&mut |id| *id = new_id);
+        let ModelingCmd::ClosePath(c) = cmd else {
+            panic!("expected ClosePath");
+        };
+        assert_eq!(c.path_id, new_id);
+    }
+
+    #[test]
+    fn entity_identity_and_effect_are_classified_for_the_representative_subset_only() {
+        let make_plane = make_plane_cmd();
+        assert_eq!(entity_identity(&make_plane), Some(EntityIdentity::OwnsEntity));
+        assert_eq!(command_effect(&make_plane), Some(CommandEffect::Creates));
+
+        let close_path = ModelingCmd::ClosePath(ClosePath::builder().path_id(Uuid::new_v4()).build());
+        assert_eq!(entity_identity(&close_path), None);
+        assert_eq!(command_effect(&close_path), None);
     }
 }
 
