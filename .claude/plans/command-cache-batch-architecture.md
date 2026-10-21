@@ -7,19 +7,35 @@ gone). Picks up from the state of branch `surgical-cache-deletes` at commit
 commands"). Read `rust/kcl-lib/src/execution/command_cache.rs`'s module docs
 and `rust/kcl-lib/src/execution/cache.rs` before this; this doc assumes both.
 
-## 1. Decision: windowed batch, not whole-file batch
+**Revision note:** the first version of this doc claimed that re-invoking
+`command_cache.rs`'s existing streaming matcher once per window, instead of
+once per command, would by itself fix the documented "insertion before
+unchanged tail" limitation, "with no change to the matcher itself." That
+claim is wrong — traced by hand, replaying the same cursor-based algorithm
+over an already-known sequence produces the identical result as streaming
+it, because the algorithm never looks ahead into the new sequence regardless
+of whether the caller already has it. A real-world duplicate-content case
+(ten identical objects, one of them later mutated) also showed a sharper
+problem the first version didn't address at all: content-addressing
+independent commands can silently reattach a *stateful* mutation's effects
+to the wrong one of several content-identical siblings. §3 below replaces
+the flawed matching design with a corrected one. §1, §4 and §5 are
+unaffected and still hold.
+
+## 1. Decision: windowed sends, not whole-file batching
 
 **Adopt the interpreter-id/real-id split now.** It is strictly good: it
 removes the retroactive-rewrite hazard of the earlier (already-rejected)
 "redraw" design, and the spike already uses an informal version of it for
 `MakePlane`.
 
-**Do not build a single flush-at-end-of-file batch.** Instead, keep batching
-scoped to the *existing* flush windows the engine wiring already has, and make
-the matcher operate on a whole window at once instead of one command at a
-time. This section explains why, because "batch" was underspecified in the
-task that kicked this off and the two readings have very different risk
-profiles.
+**Do not build a single flush-at-end-of-file batch for *sending*.** Keep the
+decision of *when a command must actually go out* scoped to the engine
+wiring's existing flush windows. The *matching* algorithm itself (§3) does
+not need this restriction and should operate over the whole run's
+accumulated content, not per-window — windowing only matters for the
+send/flush timing question in this section, not for deciding hits and
+misses.
 
 ### What a "window" already is
 
@@ -51,34 +67,22 @@ back from the engine to keep interpreting:
 That is not a short list of edge cases — it is most of the surface area that
 makes KCL's geometry model useful (every boolean, every fillet/chamfer,
 every pattern, every mirror, every extrude that anything downstream
-references by face/edge). A true whole-file batch would have to either stop
-needing these responses mid-file (not possible without changing what KCL
-*is*) or fabricate them from a cache instead of asking the engine (response
-caching — see §4). Response caching is a real, separable project with its
-own correctness assumption that is strictly stronger than anything the
-existing mechanism needs; coupling the id-translation work to it is what the
-task background flagged as the risk, and investigation confirms it: these
-two should not ship as one change.
+references by face/edge). A true whole-file batch *for sending* would have
+to either stop needing these responses mid-file (not possible without
+changing what KCL *is*) or fabricate them from a cache instead of asking the
+engine (response caching — see §4). Response caching is a real, separable
+project with its own correctness assumption that is strictly stronger than
+anything the existing mechanism needs; coupling the id-translation work to
+it is what the task background flagged as the risk, and investigation
+confirms it: these two should not ship as one change.
 
-### What windowing buys instead
-
-The documented limitation ("an insertion right before an unchanged tail
-forces a needless recreate") is a property of *streaming* matching, not of
-small windows. If a window's full content-id sequence is known before any
-hit/miss decision is committed for that window, the limitation disappears
-*within* that window, with no change to `command_cache.rs`'s matching
-algorithm at all — see §3. Since windows are already bounded by
-response-dependent ops rather than by individual statements, most real edits
-(insert a statement, delete a statement, reorder two independent chains) keep
-their surrounding unchanged content inside one window, so this captures the
-common case the worked example in `command_cache.rs` is about, without
-building response caching.
-
-**Residual limitation, explicitly accepted:** an edit whose insertion and its
-affected unchanged tail straddle two different flush windows (e.g. a new
-statement right before a `fillet()` call whose *own* edge-cut ids are what
-gets recreated) still hits the old streaming-only behavior. This is strictly
-smaller than today's status quo and does not need to be fixed to ship this.
+**What stays true regardless of §3's correction:** since matching (deciding
+hit/miss/supersede) is now index-based rather than position-based (§3), it
+does not actually need a window at all to be correct — it can and should run
+against the full previous round's log no matter how many flush windows this
+round ends up having. Windowing in this section is purely about *forced
+send timing* for response-dependent commands, not about matching
+correctness.
 
 ### A framing point worth stating plainly, because it is easy to lose
 
@@ -119,9 +123,9 @@ A per-round bidirectional table (generalizing `CommandCacheRound`'s existing
 gets into it:
 
 - **Decided before send** (today's spike path, `id_for_content`): for a
-  command whose own id *is* the identity of the entity it creates (see §3.1
-  on `OwnsEntity`), content-hash it, consult the old round's log, get back
-  `(real_id, is_hit)`. This is what `MakePlane` does today.
+  command whose own id *is* the identity of the entity it creates (see §3.2
+  on classifying commands), content-hash it, consult the old round's log,
+  get back `(real_id, is_hit)`. This is what `MakePlane` does today.
 - **Recorded after a response** (new, needed for every response-dependent
   command in the §1 list): the interpreter still mints an interpreter id via
   `next_uuid()` for whatever new entity a response just revealed (a face,
@@ -133,12 +137,147 @@ gets into it:
   as everything else.
 
 This table, not raw `Uuid`s, is what every `*_id`/`*_ids` field in a queued
-`ModelingCmd` holds while it sits in a window. Translation to real ids
-happens once, at flush time (§3.3).
+`ModelingCmd` holds while it sits in the send queue. Translation to real ids
+happens once, at flush time (§3.4).
 
-## 3. Per-command-type reference declaration
+## 3. Content identity and matching, corrected
 
-### 3.1 What actually needs declaring, and the real scope
+### 3.1 The duplicate-content-with-divergent-mutation problem
+
+Worked example (this is the scenario that broke §3's first draft): a script
+creates ten identical planes (`MakePlane` with identical params, so all ten
+hash to the same content id `C`), then sets a custom color on plane #6 only
+(`PlaneSetColor`, content id `hash(C, color)`, since today's hashing scheme
+keys a mutation's content on its *target's content id*, which is degenerate
+— shared by all ten siblings — not on the target's specific identity).
+
+Round 1: ten real ids `R1..R10` get minted in creation order; `R6` is the one
+that actually receives the color command in the engine.
+
+Round 2: an unrelated edit elsewhere disturbs the correspondence between
+"this round's Nth occurrence of `C`" and "last round's Nth occurrence of
+`C`" — this does not even require an insertion; swapping the statement order
+of plane #6 and plane #9, with nothing else touched, is enough. Position- or
+FIFO-based disambiguation among the ten now pairs them up differently than
+before. Suppose this round's "plane #5" ends up matched (by position) to old
+`R6`.
+
+This is not merely wasted work. `R6` still physically carries the custom
+color in the real engine session — matching only ever decides whether to
+*send* a command, it never decides to *reset* state on an object it chooses
+to reuse. So this round's "plane #5" (which the current script never colors)
+comes back visibly colored, and nothing in a content-addressed-by-
+independent-command scheme notices, because `PlaneSetColor`'s own content
+hash never encoded *which* real object it actually landed on last time —
+only the degenerate content id of "a plane shaped like `C`," shared by all
+ten.
+
+Meanwhile the *target* of `PlaneSetColor` resolves correctly this round
+(whichever KCL value is logically "plane #6" this round does get the color
+command re-sent against whatever real id it resolves to, since that part is
+driven by the interpreter's own variable binding, not by the cache), the
+*reused, uncolored* sibling that got silently paired with the actually-
+colored old object is the real bug: stale, divergent state leaking onto the
+wrong logical entity, invisible to the matcher.
+
+### 3.2 Root cause: two separate problems, one fix each
+
+**(a) Position-based matching can misalign even for globally unique
+content.** This is the originally-documented streaming limitation
+(`command_cache.rs`'s own module docs), and it does not actually need
+duplicate content to manifest — `[a, b]` becoming `[a, x, b]` already breaks
+it, with `a`, `x`, `b` all distinct. The existing algorithm commits a
+decision per new item based only on cursor position plus an eager index
+lookup; it never looks ahead into the new sequence, so feeding it an
+already-fully-known sequence (as the first draft of this doc proposed)
+changes nothing — confirmed by hand-tracing `match_next` over both the
+streamed and the "pre-known" versions of `[a, x, b]` against old `[a, b]`:
+identical result, `b` needlessly superseded and recreated either way.
+
+**Fix:** match by index lookup only, with no cursor and no "everything
+between cursor and the found position is superseded." Decide supersession
+by *exclusion*, once, after every new content id has been looked up: an old
+entry is superseded if and only if nothing in the complete new sequence ever
+claimed it. Retracing `[a, b]` → `[a, x, b]`: `a` hits `Ra`, `x` misses
+(genuinely new, correctly), `b` hits `Rb` — nothing is superseded. This is
+simpler than the current algorithm, not more complex, and it also makes
+pure reordering free (`[a, b, c]` → `[c, a, b]` reuses all three), which the
+cursor-based version cannot do.
+
+**(b) Content-addressing independent commands cannot disambiguate siblings
+that only diverge via later mutation.** This is the new problem in §3.1.
+Looking up `PlaneSetColor`'s content id by itself can correctly find *that
+one* old `PlaneSetColor` entry (its content, `hash(C, color)`, really is
+unique among the window's commands if only one plane was ever colored) — but
+by the time we're deciding *which of the ten MakePlane entities this round's
+color-setting statement is actually touching*, the creation-level lookup
+alone is still degenerate and must fall back to position, which is exactly
+what's unsafe.
+
+**Fix:** content identity must be per-*entity* and cumulative, not
+per-independent-command — a rolling hash chain, not unlike a Merkle chain or
+event-sourcing aggregate hash:
+
+- At creation: `chain(entity) = content_id_from_bytes(creation_command_bytes)`
+  — same as today's `id_for_content` input.
+- For every later command that **mutates** `entity` in place (rather than
+  creating something new) — `PlaneSetColor`, `ObjectSetName`,
+  `EntitySetOpacity`, and (see the caveat below) partially,
+  `Solid3dFilletEdge` — roll forward:
+  `chain(entity) := content_id_from_bytes(chain(entity) || this_mutation's own
+  fields, with any *other* entity it references substituted by *their*
+  current chain value)`.
+
+Two entities that start identical (same creation content) but have since
+received different mutations now have different chain values, full stop —
+no position reasoning needed to tell them apart once they've diverged.
+
+**Matching procedure, most-specific first:** within the set of entities being
+matched, resolve entities with a longer (more mutated, hence more likely
+globally unique) chain before entities whose chain is still at the bare
+creation level. For each, look up its current chain value in the old log's
+chain index; on a hit, consume that old entry (removing it from every
+shallower level's pool too, since a deeper match implies the shallower
+levels along the same chain are also accounted for). Once every
+distinguishable entity is resolved this way, whatever's left on both sides
+is, by construction, mutually indistinguishable — pair the remainder in any
+fixed order (position is a perfectly fine, *safe* tie-break here, because
+nothing in either round's history ever told them apart).
+
+Re-run on the worked example: this round has one entity with chain
+`[C, hash(C, color)]` and nine with chain `[C]`; so does the old log. The
+2-level chain resolves first, by direct hashmap lookup, regardless of
+position — finds the *one* old entity that ever had that exact history,
+reuses its real id correctly. That consumes one `C` from the degenerate pool
+on both sides. The remaining nine-against-nine, truly fungible, get paired
+arbitrarily — safely, this time, because the one entity that actually
+mattered was already resolved first.
+
+This also recovers the mechanism's original purpose for the case where a
+mutation's *value* changes rather than its presence: if plane #6 is colored
+red last round and blue this round, the deepest chain level misses (no old
+entity has `hash(C, blue)`), so matching falls back to the shallower,
+creation-only level (`C`, which still matches plenty of old entities) and
+reuses the plane while resending only the changed `PlaneSetColor` — not a
+full recreate.
+
+**Caveat, not yet resolved:** classifying a command as *creates* / *mutates
+an existing entity in place* / *pure query* is a third dimension on top of
+§3.4 (formerly numbered differently) below's `IdRefs`/`OwnsEntity` work, and
+it is not always clean. `Solid3dFilletEdge` both mutates `object_id` in
+place *and* produces new entities (`extra_face_ids`) — it needs both
+treatments at once, on one command. This needs a real per-variant pass
+before implementation, not an assumption that every command is purely one or
+the other.
+
+**Caveat, not yet resolved:** treating a pure statement reorder as fully
+reusable (nothing superseded, as in `[a,b,c] -> [c,a,b]`) is a *stronger*
+claim than today's behavior makes. Need to verify nothing downstream depends
+on creation order for a reason other than engine content — e.g. feature-tree
+display order, z-ordering of overlapping geometry — before relying on this
+for anything beyond the send-reduction the cache already exists to do.
+
+### 3.3 Per-command-type reference declaration
 
 Checked against the installed `kittycad-modeling-cmds = 0.2.250` crate
 (`define_modeling_cmd_enum!` in `def_enum.rs`, which generates `ModelingCmd`'s
@@ -150,19 +289,19 @@ needs re-confirming against the actual crate version in use whenever this is
 implemented, not assumed from memory.
 
 Representative, individually verified entries (full list needs a dedicated
-audit pass, see §3.4):
+audit pass, see §3.5):
 
 | Variant | id-reference fields | notes |
 |---|---|---|
 | `MakePlane` | *(none)* | its own cmd_id **is** the plane's real id |
-| `PlaneSetColor` | `plane_id: Uuid` | references, doesn't own |
+| `PlaneSetColor` | `plane_id: Uuid` | references, doesn't own; mutates in place |
 | `ExtendPath` / `MovePathPen` | `path: ModelingCmdId` | uses the dedicated id-ref newtype |
 | `Extrude` / `ExtrudeToReference` | `target: Option<ModelingCmdId>` | |
 | `Sweep` | `target: ModelingCmdId`, `trajectory: ModelingCmdId` | two references |
 | `RevolveAboutEdge` | `target: ModelingCmdId`, `edge_id: Option<Uuid>` | mixed typing in one variant |
 | `Solid3dGetExtrusionFaceInfo` | `object_id: Uuid`, `edge_id: Option<Uuid>` | query, not a creation |
 | `EntityLinearPatternTransform`, `EntityMirror`, `EntityCircularPattern` | `entity_id`/`ids: Vec<Uuid>` | response carries the *new* ids |
-| `Solid3dFilletEdge` | `object_id`, `edge_id: Option<Uuid>`, `edge_ids: Vec<Uuid>`, `extra_face_ids: Vec<Uuid>` | several reference fields on one command |
+| `Solid3dFilletEdge` | `object_id`, `edge_id: Option<Uuid>`, `edge_ids: Vec<Uuid>`, `extra_face_ids: Vec<Uuid>` | mutates in place *and* creates — see §3.2's caveat |
 
 Two typing conventions coexist (`ModelingCmdId` newtype vs. plain `Uuid`) and
 neither is reliable alone: most reference fields are plain `Uuid`, which
@@ -173,7 +312,7 @@ declaration, once, not per call site. That one-time cost is the actual "fewer
 places to change" win the task description was pointing at (vs. 146 existing
 `next_uuid()` call sites across `src/`, counted directly in this repo).
 
-### 3.2 The declaration itself
+### 3.4 The declaration itself
 
 ```rust
 /// Declared once per `ModelingCmd` variant (see the per-variant audit in
@@ -193,75 +332,22 @@ Implemented as a single `match` over `ModelingCmd` in
 normal inherent-looking impl despite `ModelingCmd` being a foreign type —
 no newtype needed). One `match` arm per one of the 106 variants that has at
 least one reference field; everything else falls through to the default.
-This is the one place that needs updating when the engine adds a command with
-a new reference field — not 106 call sites, and not the 146 `next_uuid()`
-call sites either (those are unaffected; they keep minting interpreter ids
-exactly as today).
 
-Separately, declare which variants' **own cmd_id is the identity of a
-persistent entity** (`MakePlane` today; by inspection, also e.g. `Extrude`'s
-`ModelingCmdId` for the created solid, `Solid3dFilletEdge`'s own id for the
-replacement face) versus which are disposable correlation tokens (every pure
-query: `Solid3dGetExtrusionFaceInfo`, `QueryEntityType`, `BoundingBox`, etc. —
-their *response* carries the ids that matter, their own cmd_id is thrown
-away). Only the first kind goes through `Cache::id_for_content`'s
-before-send decision (§2); the second kind always sends as a correlation id
-(no caching needed on that command's own identity — the response-dependent
-flush already forces it to go out — but its reference *fields* still need
-translation, per §3.3). This mirrors `ModelingCmdId`'s own doc comment
-("all commands have unique IDs... these should be randomly generated") not
-distinguishing the two uses at the type level, so this also needs the
-same kind of one-time, human-reviewed table, likely co-located with the
-`IdRefs` match.
+Separately, per §3.2, declare each variant's role along two axes, not one:
 
-### 3.3 Flush-time batch-diff algorithm
+- **Identity**: does its own cmd_id *own* a persistent entity (`MakePlane`,
+  by inspection also e.g. `Extrude`'s created solid), is it a pure
+  correlation token thrown away after the response (every query), or both
+  at once for part of its output (`Solid3dFilletEdge`)?
+- **Effect**: does it *create* a new entity, *mutate* an existing one in
+  place (extending that entity's chain per §3.2), or *query* (read-only,
+  extends nothing)? A command can be more than one of these simultaneously.
 
-Per window (§1):
+Neither axis is derivable from `ModelingCmdId` vs. `Uuid` typing alone, so
+both need the same kind of one-time, human-reviewed table as `IdRefs`,
+likely co-located with it.
 
-1. **Queue, unchanged.** Every `batch_modeling_cmd` call mints its
-   interpreter id via `next_uuid()` exactly as today and pushes the command,
-   addressed entirely in interpreter ids, into the window's queue. No call
-   site changes.
-2. **Content-id pass, in program order, as commands are queued (not
-   deferred to flush).** For each queued command, using `IdRefs` to find its
-   reference fields, look up each referenced interpreter id's already-decided
-   `content_id` (resolved either from an earlier window via the persisted
-   log, or from earlier in *this* window — always available by construction,
-   since a command can only reference something that was created before it)
-   and hash the command's own fields with those substituted in, exactly as
-   `content_id_of`/`id_for_content` already do. Record
-   `interpreter_id -> content_id` in the round table. This is the same work
-   the spike already does per-call-site for `MakePlane`/`PlaneSetColor`; the
-   only change is doing it uniformly via `IdRefs` instead of by hand at two
-   call sites.
-3. **Match pass, once per window, over the whole queued content-id
-   sequence.** This is `command_cache::CommandLog::match_next`, called
-   repeatedly — *unchanged* — but now fed the window's full sequence after
-   it is completely known, rather than interleaved with command production.
-   This is the entire fix for the documented limitation: by the time
-   matching starts, an inserted item's displaced successor is already in the
-   sequence being matched, so the matcher's own "look for this content id
-   later in the old log" branch (`command_cache.rs:167`) finds the
-   successor's unaffected old entry directly, instead of the streaming
-   version's forced one-step-late recreate. No change to
-   `command_cache.rs` itself — only to when its caller invokes it.
-4. **Translate and send.** For each `Hit`, take the old log's stored real
-   id, record it against the interpreter id, skip sending. For each `Miss`,
-   mint a fresh real id (a separate counter from interpreter ids — it does
-   not need to be deterministic the way interpreter ids do, since nothing
-   KCL-visible is keyed on it), rewrite the command's own id and every
-   `IdRefs`-declared field from interpreter id to real id (all resolvable by
-   now, since every reference predates this point by construction), and
-   send. For each `superseded` index, emit a delete for that old entry's real
-   id, generalizing the existing surgical-delete path
-   (`cache.rs::ids_for_deleted_statements`) from "whole trailing statements"
-   to "whole superseded log entries."
-5. **Finalize.** Same as today's `finish_command_cache_round`, after the
-   window — not the whole file — so the next window within the same run
-   already benefits, and the persisted log reflects every window's decisions
-   by end of execution.
-
-### 3.4 Before implementing
+### 3.5 Before implementing
 
 - Re-derive the 106-variant list mechanically (don't hand-maintain it from
   this doc) against whatever `kittycad-modeling-cmds` version is pinned at
@@ -270,8 +356,13 @@ Per window (§1):
   `Uuid` fields found (e.g. `CreateRegion`'s `segment`/`intersection_segment`)
   read as transient/computed rather than referencing a cacheable persistent
   entity, and need a real answer, not a guess, before being included.
-- Confirm the `OwnsEntity` vs. correlation-token classification per variant
-  against engine behavior, not naming convention alone.
+- Confirm the identity and effect classification (§3.4) per variant against
+  engine behavior, not naming convention alone.
+- Write the duplicate-content-with-divergent-mutation scenario (§3.1) as an
+  actual test *before* generalizing past `MakePlane`/`PlaneSetColor` — it is
+  the sharpest known failure mode and should gate any further widening of
+  scope, the same way the spike's own insertion test gated this doc's first
+  draft.
 
 ## 4. Response caching (explicitly out of scope for this change)
 
@@ -342,20 +433,18 @@ types before implementation, not assumed from this doc.
 
 ## 6. Suggested implementation order
 
-1. `IdRefs` trait + the per-variant match (§3.2), tested standalone against
+1. `IdRefs` trait + the per-variant match (§3.4), tested standalone against
    synthetic `ModelingCmd` values — no wiring into execution yet, same spirit
    as `command_cache.rs`'s own introduction.
-2. Generalize `CommandCacheRound`'s before-send path (today: `MakePlane` only)
-   to use `IdRefs` instead of the two hand-written call sites in
-   `std/planes.rs`, as a direct refactor of the existing spike — proves the
-   declaration mechanism against the one case already working before
-   widening scope.
-3. Window-batching of the content-id + match passes (§3.3) for a *second*
-   real call site that has more than one command per statement and shares a
-   flush window with its neighbors (a good candidate: `offsetPlane` plus a
-   following `startSketchOn`/`extrude`, which is exactly the shape of the
-   spike's own "insertion before an unchanged tail" test) — confirm the
-   limitation is actually gone within a window before generalizing further.
+2. The corrected matcher (§3.2): index-based hit/miss, exclusion-based
+   supersession, no entity chaining yet — tested against the original
+   insertion/reordering cases (including the already-existing
+   `insertion_before_an_unchanged_tail_...` test, which should now assert the
+   *opposite* of what it asserts today) before touching chains at all.
+3. Entity-chained content identity (§3.2) and the duplicate-content test from
+   §3.5, generalizing the before-send path (today: `MakePlane`/
+   `PlaneSetColor` only, by hand) to use `IdRefs` + the effect classification
+   instead of the two hand-written call sites in `std/planes.rs`.
 4. Output-boundary rewrite (§5) only once something upstream actually
    produces interpreter-id-addressed values that need it — no point building
    the translation pass before there's anything to translate.
