@@ -1,5 +1,6 @@
 //! Functions for helping with caching an ast and finding the parts the changed.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -44,15 +45,18 @@ struct CacheInner {
     pub old_ast: Option<GlobalState>,
     // The last successful run's memory. Not cleared after an unsuccessful run.
     pub prev_memory: Option<SketchModeState>,
-    /// Spike (see `execution::command_cache`): the previous run's
-    /// content-addressed command log, consulted by `Cache::id_for_content`
-    /// to decide whether a command needs sending at all. Not yet written by
-    /// any real execution path - only by the spike's own test, until this
-    /// is wired into `prepare_cached_execution` for real.
-    command_log: Option<crate::execution::command_cache::CommandLog<Uuid>>,
-    /// Spike: this run's content-addressed decisions, being built up as
-    /// `id_for_content` is called; swapped into `command_log` by
-    /// `finish_command_cache_round` at the end of a successful run.
+    /// The previous run's content-addressed entity chains (see
+    /// `execution::command_cache`), consulted by
+    /// `Cache::resolve_pending` to decide which queued commands need
+    /// sending at all. Written for real by `finish_command_cache_round`,
+    /// called from `std/planes.rs`'s `offsetPlane` spike today - see the
+    /// design note (`.claude/plans/command-cache-batch-architecture.md`)
+    /// for why this is still scoped to that one call site.
+    command_log: Option<crate::execution::command_cache::ChainLog<Uuid>>,
+    /// This run's entity registrations and real-id decisions, accumulated
+    /// as `register_creation`/`register_mutation`/`resolve_pending` are
+    /// called; swapped into `command_log` by `finish_command_cache_round`
+    /// at the end of a successful run.
     current_round: crate::execution::command_cache::CommandCacheRound,
 }
 
@@ -120,45 +124,92 @@ impl Cache {
             .and_then(|memory| memory.stack.get(name, SourceRange::default()).ok())
     }
 
-    /// Spike (see `execution::command_cache`): decide the real id for a new
-    /// engine entity whose command content hashes to `content_id`. Returns
-    /// `(id, true)` on a hit - the caller must *skip* sending the command
-    /// and reuse `id` - or `(id, false)` on a miss, where `id` comes from
-    /// `mint_fresh` and the caller must send the command for real. Either
-    /// way, the decision is recorded so a later call this run can look up
-    /// this id's content id via `content_id_of`, and so it becomes part of
-    /// the log the *next* run matches against.
-    pub(crate) async fn id_for_content(
+    /// Register a new engine entity's creation (see
+    /// `execution::command_cache`'s `CommandCacheRound::register_creation`):
+    /// `entity_id` is the entity's interpreter id, assigned immediately by
+    /// the caller via `next_uuid()` and never rewritten, and `content_id`
+    /// is its creation command's content hash. Does **not** decide a real
+    /// id yet - that happens later, in a batch, via
+    /// [`Self::resolve_pending`], once enough of the round is known to
+    /// disambiguate correctly against content-identical siblings.
+    pub(crate) async fn register_creation(
         &self,
+        entity_id: Uuid,
         content_id: crate::execution::command_cache::ContentId,
-        mint_fresh: impl FnOnce() -> Uuid,
-    ) -> (Uuid, bool) {
+    ) {
+        self.0
+            .inner()
+            .write()
+            .await
+            .current_round
+            .register_creation(entity_id, content_id);
+    }
+
+    /// Register an in-place mutation against an already-registered entity
+    /// (see `CommandCacheRound::register_mutation`). `mutation_step_id` is
+    /// the mutation command's own id (never an identity to resolve a
+    /// reference to - only used to key this one step's own hit/miss
+    /// decision); `entity_id` stays the entity's own, for reference-field
+    /// translation.
+    pub(crate) async fn register_mutation(&self, entity_id: Uuid, mutation_step_id: Uuid, mutation_content: &[u8]) {
+        self.0
+            .inner()
+            .write()
+            .await
+            .current_round
+            .register_mutation(entity_id, mutation_step_id, mutation_content);
+    }
+
+    /// Resolve every entity registered (or extended by a mutation) since
+    /// the last call, returning a decision per *step* id: `(real_id,
+    /// is_hit)`. Call this once, right before a flush is actually about to
+    /// send anything - see `ExecState::flush_batch`, the only real caller
+    /// today.
+    pub(crate) async fn resolve_pending(&self) -> HashMap<Uuid, (Uuid, bool)> {
         let mut inner = self.0.inner().write().await;
         let CacheInner {
             command_log,
             current_round,
             ..
         } = &mut *inner;
-        current_round.id_for_content(command_log.as_mut(), content_id, mint_fresh)
+        current_round.resolve_pending(command_log.as_mut())
     }
 
-    /// Spike: look up a previously-decided real id's content id *from this
-    /// run*, for substituting into a later command's own content hash
-    /// instead of hashing the raw, run-to-run-unstable real id directly.
-    pub(crate) async fn content_id_of(&self, real_id: Uuid) -> Option<crate::execution::command_cache::ContentId> {
-        self.0.inner().read().await.current_round.content_id_of(real_id)
+    /// Every entity resolved so far this round, id -> real id - for
+    /// rewriting a *reference* field (one entity mentioning another),
+    /// which [`Self::resolve_pending`]'s own return value doesn't cover
+    /// (it's keyed by step id, not entity id). Read alongside
+    /// `resolve_pending`'s result by the same caller, in the same flush.
+    pub(crate) async fn resolved_entity_ids(&self) -> HashMap<Uuid, Uuid> {
+        self.0.inner().read().await.current_round.resolved_entity_ids()
     }
 
-    /// Spike: finalize this run's content-addressed decisions into the log
-    /// the next run will match against, and reset the accumulator. Only
-    /// called by this spike's own tests for now - real callers will call it
-    /// from `finish_cached_execution` once this is wired in for real,
+    /// Look up one entity's resolved real id directly - a convenience over
+    /// [`Self::resolved_entity_ids`] for a caller (tests, mainly) that only
+    /// needs one.
+    #[cfg(test)]
+    pub(crate) async fn real_id_of(&self, entity_id: Uuid) -> Option<Uuid> {
+        self.0.inner().read().await.current_round.real_id_of(entity_id)
+    }
+
+    /// Finalize this run's entity chains and real-id decisions into the
+    /// log the next run will match against, and reset the accumulator.
+    /// Resolves anything still pending first (see
+    /// `CommandCacheRound::into_log`). Only called by `std/planes.rs`'s
+    /// spike call sites today - real callers will call it from
+    /// `finish_cached_execution` once this is wired in more broadly,
     /// alongside `write_old_ast`.
     #[allow(dead_code)]
     pub(crate) async fn finish_command_cache_round(&self) {
         let mut inner = self.0.inner().write().await;
-        let round = std::mem::take(&mut inner.current_round);
-        inner.command_log = Some(round.into_log());
+        let CacheInner {
+            command_log,
+            current_round,
+            ..
+        } = &mut *inner;
+        let round = std::mem::take(current_round);
+        let new_log = round.into_log(command_log.as_mut());
+        *command_log = Some(new_log);
     }
 }
 

@@ -16,6 +16,7 @@ use crate::exec::KclValue;
 use crate::execution::EntityCloneInfo;
 use crate::execution::FaceParentSolid;
 use crate::execution::Solid;
+use crate::execution::command_cache::IdRefs;
 use crate::std::Args;
 
 /// Developer toggle for the KCL 3.0 behavior where edge cuts (fillets and
@@ -299,6 +300,52 @@ impl ExecState {
         if self.is_in_sketch_block() {
             return Err(no_modeling_in_sketch_block_error(meta.source_range));
         }
+
+        // Resolve anything the deferred content-cache mechanism (see
+        // `execution::command_cache`) has registered since the last flush,
+        // and translate/filter this batch in place before it's actually
+        // sent - a cache hit is dropped entirely, a miss has its own id
+        // (and any reference field elsewhere pointing at the same entity)
+        // rewritten from interpreter id to real id. A cheap no-op for every
+        // flush that doesn't involve it - today, every flush except the
+        // ones `std/planes.rs`'s `offsetPlane` queues into. See the design
+        // note's SS2 and SS4.
+        let decisions = meta.ctx.cache.resolve_pending().await;
+        if !decisions.is_empty() {
+            let entity_real_ids = meta.ctx.cache.resolved_entity_ids().await;
+            meta.ctx
+                .engine_batch
+                .with_pending_batch(|batch| {
+                    batch
+                        .into_iter()
+                        .filter_map(|(mut req, range)| {
+                            let kcmc::websocket::WebSocketRequest::ModelingCmdReq(req_inner) = &mut req else {
+                                return Some((req, range));
+                            };
+                            match decisions.get(&req_inner.cmd_id.0) {
+                                // Not part of this round's mechanism - every
+                                // other command in the app, untouched.
+                                None => Some((req, range)),
+                                // A hit: drop it, nothing to send.
+                                Some((_, true)) => None,
+                                // A miss: rewrite this command's own id and
+                                // every reference field `IdRefs` finds.
+                                Some((real_id, false)) => {
+                                    req_inner.cmd_id = (*real_id).into();
+                                    req_inner.cmd.for_each_id_ref_mut(&mut |rid| {
+                                        if let Some(real) = entity_real_ids.get(rid) {
+                                            *rid = *real;
+                                        }
+                                    });
+                                    Some((req, range))
+                                }
+                            }
+                        })
+                        .collect()
+                })
+                .await;
+        }
+
         meta.ctx
             .engine
             .flush_batch(&meta.ctx.engine_batch, batch_end, meta.source_range)

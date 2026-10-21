@@ -228,14 +228,18 @@ async fn inner_offset_plane(
 // offset planes are shown by default, and hidden by default if they
 // are used as a sketch plane. That hiding command is sent within create_sketch.
 //
-// Spike (see `execution::command_cache`): `MakePlane`'s and `PlaneSetColor`'s
-// ids are decided content-addressed, not via a plain `exec_state.next_uuid()`
-// - see the module docs on `command_cache` for why this matters (deleting
-// something that merely moved in the file shouldn't force a real resend of
-// everything unaffected by the edit). `plane.id`/`plane.artifact_id` are
-// placeholders from the caller until this decides the real one and
-// overwrites them, mirroring `ensure_sketch_plane_in_engine`'s existing
-// pattern of deciding a plane's real id late, right before it's needed.
+// `MakePlane`'s and `PlaneSetColor`'s ids go through the deferred
+// content-addressed mechanism in `execution::command_cache`, not a plain
+// `exec_state.next_uuid()` used directly as the wire id. `plane.id` /
+// `plane.artifact_id` are set to the *interpreter* id below, immediately,
+// and never rewritten after that - the real engine id is decided later, at
+// flush time (`ExecState::flush_batch`'s translation step), once this
+// entity's whole chain (creation plus any mutation, here just the color)
+// is known. See the design note's SS2 and SS4 for why this split exists
+// and why it has to work this way: deciding the real id eagerly here,
+// the way an earlier version of this function did, could not correctly
+// disambiguate this plane from a content-identical sibling once any of
+// them diverges via a later mutation - see the design note's SS3.1.
 async fn make_offset_plane_in_engine(
     plane: &mut Plane,
     exec_state: &mut ExecState,
@@ -244,6 +248,12 @@ async fn make_offset_plane_in_engine(
     // Create new default planes.
     let default_size = 100.0;
     let color = Color::from_rgba(0.6, 0.6, 0.6, 0.3);
+
+    // Interpreter id: assigned now, used as this plane's identity for the
+    // rest of execution, never rewritten.
+    let interpreter_id = exec_state.next_uuid();
+    plane.id = interpreter_id;
+    plane.artifact_id = interpreter_id.into();
 
     let make_plane_cmd = mcmd::MakePlane::builder()
         .clobber(false)
@@ -260,13 +270,10 @@ async fn make_offset_plane_in_engine(
                 vec![args.source_range],
             ))
         })?);
-    let (real_id, make_plane_is_hit) = args
-        .ctx
+    args.ctx
         .cache
-        .id_for_content(make_plane_content_id, || exec_state.next_uuid())
+        .register_creation(interpreter_id, make_plane_content_id)
         .await;
-    plane.id = real_id;
-    plane.artifact_id = real_id.into();
 
     let plane_object_id = exec_state.next_object_id();
     let plane_object = kcl_api::Object {
@@ -279,51 +286,46 @@ async fn make_offset_plane_in_engine(
     };
     exec_state.add_scene_object(plane_object, args.source_range);
 
-    if !make_plane_is_hit {
-        let meta = ModelingCmdMeta::with_id(exec_state, &args.ctx, args.source_range, real_id);
-        exec_state
-            .batch_modeling_cmd(meta, ModelingCmd::from(make_plane_cmd))
-            .await?;
-    }
+    // Always queue it, under its interpreter id - whether it's actually
+    // sent, and with which real id, is decided later at flush time, not
+    // here (contrast with the hand-decided `make_plane_is_hit` this
+    // function used to check before queueing at all).
+    let meta = ModelingCmdMeta::with_id(exec_state, &args.ctx, args.source_range, interpreter_id);
+    exec_state
+        .batch_modeling_cmd(meta, ModelingCmd::from(make_plane_cmd))
+        .await?;
 
     // Set the color.
     // PlaneSetColor is blocked on CPU engines until https://github.com/KittyCAD/engine/pull/5127 or similar is merged
     if !exec_state.geometry_only() {
-        // `plane_id` must be hashed as the plane's *content* id, not its
-        // real id - the real id is only stable for this run; the content
-        // id is what lets this match a previous run's `PlaneSetColor` even
-        // if `plane.id` shifted (see the module docs on `command_cache`).
-        let plane_content_id = args
-            .ctx
+        let set_color_content = serde_json::to_vec(&color).map_err(|e| {
+            KclError::new_internal(KclErrorDetails::new(
+                format!("failed to serialize color for content hashing: {e}"),
+                vec![args.source_range],
+            ))
+        })?;
+        // This mutation's own id (keys only its own hit/miss decision -
+        // never an identity anything else resolves a reference to).
+        let set_color_step_id = exec_state.next_uuid();
+        args.ctx
             .cache
-            .content_id_of(plane.id)
-            .await
-            .expect("just recorded by id_for_content above");
-        let set_color_content_id = crate::execution::command_cache::content_id_from_bytes(
-            &[
-                serde_json::to_vec(&color).map_err(|e| {
-                    KclError::new_internal(KclErrorDetails::new(
-                        format!("failed to serialize color for content hashing: {e}"),
-                        vec![args.source_range],
-                    ))
-                })?,
-                plane_content_id.to_vec(),
-            ]
-            .concat(),
-        );
-        let (_, set_color_is_hit) = args
-            .ctx
-            .cache
-            .id_for_content(set_color_content_id, || exec_state.next_uuid())
+            .register_mutation(interpreter_id, set_color_step_id, &set_color_content)
             .await;
-        if !set_color_is_hit {
-            exec_state
-                .batch_modeling_cmd(
-                    ModelingCmdMeta::from_args(exec_state, args),
-                    ModelingCmd::from(mcmd::PlaneSetColor::builder().color(color).plane_id(plane.id).build()),
-                )
-                .await?;
-        }
+        exec_state
+            .batch_modeling_cmd(
+                ModelingCmdMeta::with_id(exec_state, &args.ctx, args.source_range, set_color_step_id),
+                // `plane_id` here is the plane's *interpreter* id - same
+                // as `plane.id` everywhere else in this function - and
+                // gets translated to a real id at flush time along with
+                // everything else.
+                ModelingCmd::from(
+                    mcmd::PlaneSetColor::builder()
+                        .color(color)
+                        .plane_id(interpreter_id)
+                        .build(),
+                ),
+            )
+            .await?;
     }
 
     // Though offset planes might be derived from standard planes, they are

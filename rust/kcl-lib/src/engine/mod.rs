@@ -158,6 +158,24 @@ impl EngineBatchContext {
     async fn take_batch_end(&self) -> IndexMap<Uuid, (WebSocketRequest, SourceRange)> {
         std::mem::take(&mut *self.batch_end.write().await)
     }
+
+    /// Replace the currently-queued, not-yet-sent batch with the result of
+    /// applying `f` to it - a hook for a caller to translate or filter
+    /// queued commands before the next flush actually sends them, without
+    /// this module needing to know why. Used by the deferred
+    /// content-addressed command cache (see `execution::command_cache` and
+    /// `ExecState::flush_batch`) to rewrite interpreter ids to real ids and
+    /// drop cache hits; deliberately generic so this module stays
+    /// decoupled from that mechanism. A no-op for any caller that never
+    /// calls it, which is every caller except that one today.
+    pub(crate) async fn with_pending_batch(
+        &self,
+        f: impl FnOnce(Vec<(WebSocketRequest, SourceRange)>) -> Vec<(WebSocketRequest, SourceRange)>,
+    ) {
+        let mut batch = self.batch.write().await;
+        let taken = std::mem::take(&mut *batch);
+        *batch = f(taken);
+    }
 }
 
 #[derive(Default, Debug)]

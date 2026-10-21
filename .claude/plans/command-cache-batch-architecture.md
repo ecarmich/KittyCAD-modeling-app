@@ -483,22 +483,62 @@ types before implementation, not assumed from this doc.
    `duplicate_content_pairs_with_earliest_unconsumed_occurrence_first`
    stays green but its doc comment now points at what it *doesn't* cover
    (divergent mutation among duplicates - step 3's job).
-3. **Partly done.** Entity-chained content identity (`EntityChain`,
-   `ChainLog`, `ChainMatch`, `match_round`) and the duplicate-content test
-   from §3.5 are implemented and passing in `command_cache.rs`, standalone.
-   **Not done, and now known not to be safe yet:** generalizing the
-   before-send path to replace the two hand-written call sites in
-   `std/planes.rs`. That turns out to need real ids deferred until a whole
-   round's chains are known — i.e. §2's split actually implemented in code,
-   not just designed — which this step did not anticipate going in. Revisit
-   `std/planes.rs` only after §2 exists for real; see §3.2's "discovered
-   while implementing" note.
-4. §2's interpreter-id/real-id split, for real — newly promoted ahead of
-   output-boundary work by step 3's finding above: it's not just needed for
-   `ExecOutcome`/the artifact graph (§5), it's the actual blocker on using
-   the chain matcher for anything beyond its own standalone tests.
-5. Output-boundary rewrite (§5) once §2 exists and something upstream
-   actually produces interpreter-id-addressed values that need it.
+3. **Done**, completed by step 4 below. Entity-chained content identity
+   (`EntityChain`, `ChainLog`, `ChainMatch`, `match_round`) and the
+   duplicate-content test from §3.5 were implemented and passing in
+   `command_cache.rs`, standalone, before step 4 existed - at that point
+   generalizing past the two hand-written call sites in `std/planes.rs`
+   was explicitly *not* safe, because it needed real ids deferred until a
+   whole round's chains are known (§2's split, not yet implemented in code
+   at the time). Step 4 built that split for real and `std/planes.rs` now
+   uses the chain mechanism directly - see step 4.
+4. **Done.** §2's interpreter-id/real-id split, implemented for real, not
+   just designed - this is what actually unblocked step 3's chain matcher
+   for live use rather than only its own standalone tests. Concretely:
+   - `CommandCacheRound` reshaped around `register_creation`/
+     `register_mutation` (record immediately, decide nothing yet) and
+     `resolve_pending` (decide a batch of real ids at once, right before a
+     flush is about to send anything - see below).
+   - `EngineBatchContext::with_pending_batch` (`engine/mod.rs`): a small,
+     fully generic, purely additive hook - take the queued-but-unsent
+     batch, let the caller transform it, put it back. Zero behavior change
+     for any caller that doesn't use it (everyone except the one below).
+   - `ExecState::flush_batch` (`execution/modeling.rs`): the actual
+     translation step, now the single common chokepoint for all of this.
+     Calls `resolve_pending`, and - only when it returns something
+     non-empty, a cheap no-op otherwise - rewrites each queued command's
+     own id and reference fields (via `IdRefs`) from interpreter id to
+     real id, or drops it outright on a hit. Every flush that isn't part
+     of this mechanism (effectively every flush in the entire app except
+     the two below) passes through completely untouched.
+   - `std/planes.rs`'s `make_offset_plane_in_engine`: now mints a plain
+     interpreter id immediately (reverting the eager, pre-step-4 decision)
+     and registers creation/mutation content instead of hand-computing and
+     resolving a real id inline. The two existing end-to-end tests in
+     `execution/mod.rs` were rewritten to check the *real* id
+     (`Cache::real_id_of`) rather than `plane.id` (now just the
+     deterministic interpreter id, which would make a same-id assertion
+     vacuous) - and the second one, previously asserting the known
+     streaming-matcher limitation, now asserts the fix instead: inserting
+     an unrelated statement before `plane001` no longer forces a recreate,
+     verified end-to-end through the real call sites and the flush-time
+     translation step, not just at the unit level.
+   - Verified with no regressions: stashed this branch's changes and ran
+     the identical targeted test sweep (`execution::`, `std::planes::`,
+     `engine::`, `command_cache`) against the unmodified baseline - the
+     same 44 tests fail on both (all pre-existing, needing `ZOO_API_TOKEN`/
+     network access this environment doesn't have, confirmed unrelated by
+     inspecting their panics), and the one test this step actually changes
+     the behavior of flips from failing to passing only on this branch.
+5. Output-boundary rewrite (§5): still not done. `ExecOutcome.variables`
+   now really does carry interpreter ids for `offsetPlane`'s planes (not
+   just a theoretical future concern) - nothing downstream translates them
+   back to real ids yet. Low blast radius today only because the two
+   affected end-to-end tests read `Cache::real_id_of` directly instead of
+   going through `ExecOutcome`; a real caller reading `KclValueView`
+   normally would see the wrong (interpreter, not real) id for an
+   offsetPlane's plane. This is now a real, live gap, not a hypothetical
+   one - next in line.
 6. Response caching (§4): separate follow-up, not a prerequisite for 1-5.
 
 Each step should land as its own reviewable commit with its own tests, same

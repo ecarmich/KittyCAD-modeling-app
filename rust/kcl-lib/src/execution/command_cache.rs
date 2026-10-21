@@ -395,67 +395,200 @@ pub(crate) fn match_round<Payload>(old: &mut ChainLog<Payload>, new_chains: &[En
     results
 }
 
-/// Spike: accumulates one real run's content-addressed id decisions, both to
-/// make this run's own decisions (via [`Self::content_id_of`], for
-/// substituting an already-decided id's content identity into a later
-/// command that references it) and to become the next run's [`CommandLog`]
-/// (via [`Self::into_log`]).
+/// One entity registered this round, not yet (or not only) resolved: its
+/// accumulated [`EntityChain`] and the interpreter id of every step that
+/// contributed to it. `steps[0]` is always the entity's own creation step -
+/// by construction the same id the caller registered the entity itself
+/// under (see [`CommandCacheRound::register_creation`]) - and `steps[n]`
+/// for `n >= 1` is the `n`th mutation's own step id (see
+/// [`CommandCacheRound::register_mutation`]), used only to key that one
+/// step's hit/miss decision, never to identify the entity itself.
+#[derive(Debug, Clone)]
+struct PendingEntity {
+    chain: EntityChain,
+    steps: Vec<uuid::Uuid>,
+}
+
+/// Accumulates one real run's entity chains and the real-id decisions
+/// resolved from them so far, both to make this run's own decisions (via
+/// [`Self::real_id_of`], for substituting an already-resolved entity's real
+/// id into a later command that references it) and to become the next
+/// run's [`ChainLog`] (via [`Self::into_log`]).
 ///
-/// This specializes [`CommandLog`]'s payload to `uuid::Uuid`: for this
-/// spike, all that needs to survive between runs for each logged command is
-/// the real engine id it was (or would have been) sent with.
+/// Entities are registered as soon as their commands are produced
+/// ([`Self::register_creation`], [`Self::register_mutation`]) but not
+/// resolved to a real id immediately - [`Self::resolve_pending`] does that,
+/// in a batch, for every entity registered since the last call. This is
+/// the split described in the design note's SS2: an entity's *interpreter*
+/// id (what KCL code and other commands reference, assigned immediately,
+/// never rewritten) is decoupled from its *real* engine id (decided only
+/// once enough of the round is known to disambiguate correctly against
+/// content-identical siblings via chaining - see SS3).
+///
+/// This specializes [`ChainLog`]'s payload to `uuid::Uuid`: all that needs
+/// to survive between runs for each logged entity is the real engine id it
+/// was (or would have been) sent with.
 #[derive(Debug, Default)]
 pub(crate) struct CommandCacheRound {
-    entries: Vec<LogEntry<uuid::Uuid>>,
-    id_map: HashMap<uuid::Uuid, ContentId>,
+    entities: Vec<PendingEntity>,
+    /// Entity (creation step) id -> index into `entities`, so
+    /// `register_mutation` can find the right chain to extend.
+    entity_index: HashMap<uuid::Uuid, usize>,
+    /// Indices into `entities` not yet resolved - drained by
+    /// `resolve_pending`.
+    pending: Vec<usize>,
+    /// Entity id -> its resolved real engine id, for every entity resolved
+    /// so far this round (by any call to `resolve_pending`, not just the
+    /// most recent one) - read by [`Self::real_id_of`].
+    entity_real_id: HashMap<uuid::Uuid, uuid::Uuid>,
     pub(crate) hits: usize,
     pub(crate) misses: usize,
 }
 
 impl CommandCacheRound {
-    /// Decide the real id for a new entity whose command content hashes to
-    /// `content_id`: reuse an old real id (a hit - the caller must skip
-    /// sending) if `old_log`'s match finds one, or mint fresh via
-    /// `mint_fresh` (a miss - the caller must send for real) otherwise.
-    /// Either way, record the decision so later calls this run can look up
-    /// this real id's content id (see [`Self::content_id_of`]), and so it
-    /// becomes part of the log the next run matches against.
-    pub(crate) fn id_for_content(
-        &mut self,
-        old_log: Option<&mut CommandLog<uuid::Uuid>>,
-        content_id: ContentId,
-        mint_fresh: impl FnOnce() -> uuid::Uuid,
-    ) -> (uuid::Uuid, bool) {
-        let (real_id, is_hit) = match old_log {
-            Some(log) => match log.match_next(content_id) {
-                MatchDecision::Hit { old_index } => (*log.payload(old_index), true),
-                MatchDecision::Miss => (mint_fresh(), false),
-            },
-            None => (mint_fresh(), false),
-        };
-        self.record(content_id, real_id);
-        (real_id, is_hit)
-    }
-
-    /// Look up a previously-decided real id's content id, for substituting
-    /// into a later command's own content hash (see the module docs on why
-    /// a raw real id must never be hashed directly).
-    pub(crate) fn content_id_of(&self, real_id: uuid::Uuid) -> Option<ContentId> {
-        self.id_map.get(&real_id).copied()
-    }
-
-    fn record(&mut self, content_id: ContentId, real_id: uuid::Uuid) {
-        self.entries.push(LogEntry {
-            content_id,
-            payload: real_id,
+    /// Register a new entity's creation. `entity_id` is both the entity's
+    /// identity (what a later reference field should resolve to via
+    /// [`Self::real_id_of`]) and this creation step's own id (what
+    /// [`Self::resolve_pending`]'s decision map keys the hit/miss decision
+    /// on) - the same value, because there is nothing "before" a creation
+    /// in its chain to tell the two apart.
+    pub(crate) fn register_creation(&mut self, entity_id: uuid::Uuid, content_id: ContentId) {
+        let index = self.entities.len();
+        self.entities.push(PendingEntity {
+            chain: EntityChain::new(content_id),
+            steps: vec![entity_id],
         });
-        self.id_map.insert(real_id, content_id);
+        self.entity_index.insert(entity_id, index);
+        self.pending.push(index);
+    }
+
+    /// Register a mutation against an already-registered entity.
+    /// `mutation_step_id` is this *mutation's own* id (e.g. a
+    /// `PlaneSetColor` command's own `cmd_id`, never reused as any
+    /// identity - only used to key this one step's own hit/miss decision);
+    /// `entity_id` stays the entity's (e.g. the plane's), used for
+    /// reference-field translation.
+    pub(crate) fn register_mutation(
+        &mut self,
+        entity_id: uuid::Uuid,
+        mutation_step_id: uuid::Uuid,
+        mutation_content: &[u8],
+    ) {
+        let &index = self
+            .entity_index
+            .get(&entity_id)
+            .expect("register_mutation called before register_creation for this entity");
+        self.entities[index].chain.extend(mutation_content);
+        self.entities[index].steps.push(mutation_step_id);
+        if !self.pending.contains(&index) {
+            self.pending.push(index);
+        }
+    }
+
+    /// Resolve every entity registered (or re-registered via a mutation)
+    /// since the last call, against `old_log`. Returns a decision per
+    /// *step* id (every id passed to `register_creation` or
+    /// `register_mutation` since the last call): `(real_id, is_hit)` - the
+    /// caller must skip sending a hit, and must rewrite a miss's own id (and
+    /// any reference field elsewhere pointing at the entity, via
+    /// [`Self::real_id_of`]) to `real_id` before sending.
+    pub(crate) fn resolve_pending(
+        &mut self,
+        old_log: Option<&mut ChainLog<uuid::Uuid>>,
+    ) -> HashMap<uuid::Uuid, (uuid::Uuid, bool)> {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return HashMap::new();
+        }
+
+        let chains: Vec<EntityChain> = pending.iter().map(|&i| self.entities[i].chain.clone()).collect();
+        let mut decisions = HashMap::new();
+
+        match old_log {
+            Some(log) => {
+                // `log` is reborrowed mutably by `match_round` and then
+                // immutably by `log.payload(...)` below - sequential, not
+                // overlapping, so this is an ordinary reborrow, not a
+                // conflict.
+                let matches = match_round(log, &chains);
+                for (&index, chain_match) in pending.iter().zip(matches) {
+                    let (real_id, matched_depth) = match chain_match {
+                        ChainMatch::FullHit { old_index } => {
+                            self.hits += 1;
+                            (*log.payload(old_index), Some(self.entities[index].chain.depth()))
+                        }
+                        ChainMatch::PartialHit {
+                            old_index,
+                            matched_depth,
+                        } => {
+                            self.hits += 1;
+                            (*log.payload(old_index), Some(matched_depth))
+                        }
+                        ChainMatch::Miss => {
+                            self.misses += 1;
+                            (uuid::Uuid::new_v4(), None)
+                        }
+                    };
+                    let entity = &self.entities[index];
+                    self.entity_real_id.insert(entity.steps[0], real_id);
+                    for (depth, &step_id) in entity.steps.iter().enumerate() {
+                        let is_hit = matched_depth.is_some_and(|matched| depth <= matched);
+                        decisions.insert(step_id, (real_id, is_hit));
+                    }
+                }
+            }
+            None => {
+                // No previous round to match against at all (the very
+                // first run): every entity is a miss.
+                for &index in &pending {
+                    self.misses += 1;
+                    let real_id = uuid::Uuid::new_v4();
+                    let entity = &self.entities[index];
+                    self.entity_real_id.insert(entity.steps[0], real_id);
+                    for &step_id in &entity.steps {
+                        decisions.insert(step_id, (real_id, false));
+                    }
+                }
+            }
+        }
+        decisions
+    }
+
+    /// Look up an already-resolved entity's real id, for substituting into
+    /// a later command's *reference* field (see the module docs on why a
+    /// raw interpreter id must never be sent directly). Only meaningful
+    /// once [`Self::resolve_pending`] has resolved this entity - true for
+    /// any entity this round has resolved so far, by any call.
+    pub(crate) fn real_id_of(&self, entity_id: uuid::Uuid) -> Option<uuid::Uuid> {
+        self.entity_real_id.get(&entity_id).copied()
+    }
+
+    /// A snapshot of every entity resolved so far this round, id -> real
+    /// id - for a caller that needs the whole map at once (e.g. to
+    /// translate a batch of queued commands synchronously) rather than one
+    /// [`Self::real_id_of`] lookup at a time.
+    pub(crate) fn resolved_entity_ids(&self) -> HashMap<uuid::Uuid, uuid::Uuid> {
+        self.entity_real_id.clone()
     }
 
     /// Finalize this run's decisions into the log the next run will match
-    /// against.
-    pub(crate) fn into_log(self) -> CommandLog<uuid::Uuid> {
-        CommandLog::new(self.entries)
+    /// against. Resolves anything still pending first, so nothing
+    /// registered but never explicitly flushed is silently dropped from
+    /// the next run's log.
+    pub(crate) fn into_log(mut self, old_log: Option<&mut ChainLog<uuid::Uuid>>) -> ChainLog<uuid::Uuid> {
+        self.resolve_pending(old_log);
+        let entries = self
+            .entities
+            .into_iter()
+            .map(|entity| {
+                let real_id = *self
+                    .entity_real_id
+                    .get(&entity.steps[0])
+                    .expect("every entity was just resolved above");
+                (entity.chain, real_id)
+            })
+            .collect();
+        ChainLog::new(entries)
     }
 }
 

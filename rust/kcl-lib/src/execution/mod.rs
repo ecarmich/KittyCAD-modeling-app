@@ -5523,14 +5523,21 @@ solid7 = extrude(r7, length = width)
         mock.close().await;
     }
 
-    /// Spike (see `execution::command_cache` and `std/planes.rs`'s
-    /// `make_offset_plane_in_engine`): with nothing shifted at all, a
-    /// `plane001 = offsetPlane(...)` call's `MakePlane`/`PlaneSetColor`
-    /// commands are both correctly recognized as hits on a second run of
-    /// the identical program - no insertion/deletion/reordering involved,
-    /// so this is the simple, direct-positional-match case, proving the
-    /// basic plumbing (id_for_content, the substitution lookup) before the
-    /// harder "something shifted" case below.
+    /// With nothing shifted at all, a `plane001 = offsetPlane(...)` call's
+    /// `MakePlane`/`PlaneSetColor` commands are both correctly recognized
+    /// as hits on a second run of the identical program - no insertion,
+    /// deletion, or reordering involved, so this is the simple case,
+    /// proving the basic plumbing (`register_creation`/`register_mutation`/
+    /// `resolve_pending`, wired into `ExecState::flush_batch`'s translation
+    /// step) end-to-end before the harder "something shifted" case below.
+    ///
+    /// `value.id` on a `KclValue::Plane` is the plane's *interpreter* id
+    /// (see the design note's SS2 and `std/planes.rs`'s
+    /// `make_offset_plane_in_engine`) - deterministic by construction
+    /// (`next_uuid()`), so comparing it alone would prove nothing about
+    /// caching. What the cache actually promises is that the *real* engine
+    /// id (`Cache::real_id_of`) agrees across runs too - i.e. the second
+    /// run actually reused the first run's engine object.
     #[tokio::test(flavor = "multi_thread")]
     async fn command_cache_spike_reuses_offset_plane_id_when_nothing_shifted() {
         let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
@@ -5538,58 +5545,71 @@ solid7 = extrude(r7, length = width)
 
         let mut exec_state_1 = ExecState::new(&ctx);
         let (main_ref_1, _) = ctx.run(&program, &mut exec_state_1).await.unwrap();
-        ctx.cache.finish_command_cache_round().await;
         let vars_1 = exec_state_1.mod_local.variables(main_ref_1).unwrap();
-        let plane_id_1 = match vars_1.get("plane001").unwrap() {
+        let interpreter_id_1 = match vars_1.get("plane001").unwrap() {
             KclValue::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
+        let real_id_1 = ctx
+            .cache
+            .real_id_of(interpreter_id_1)
+            .await
+            .expect("resolved by the root block's flush inside ctx.run()");
+        ctx.cache.finish_command_cache_round().await;
 
         let mut exec_state_2 = ExecState::new(&ctx);
         let (main_ref_2, _) = ctx.run(&program, &mut exec_state_2).await.unwrap();
-        ctx.cache.finish_command_cache_round().await;
         let vars_2 = exec_state_2.mod_local.variables(main_ref_2).unwrap();
-        let plane_id_2 = match vars_2.get("plane001").unwrap() {
+        let interpreter_id_2 = match vars_2.get("plane001").unwrap() {
             KclValue::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
+        let real_id_2 = ctx
+            .cache
+            .real_id_of(interpreter_id_2)
+            .await
+            .expect("resolved by the root block's flush inside ctx.run()");
+        ctx.cache.finish_command_cache_round().await;
 
+        assert_eq!(interpreter_id_1, interpreter_id_2);
         assert_eq!(
-            plane_id_1, plane_id_2,
+            real_id_1, real_id_2,
             "an unchanged program's plane should get the same real id both runs"
         );
         ctx.close().await;
     }
 
-    /// Spike: the harder case - an unrelated statement inserted *before*
-    /// `plane001` shifts the deterministic id-generator counter, so a naive
-    /// real-id comparison would see everything after it as "different".
-    /// This test exists to confirm (empirically, not just by reasoning
-    /// about it) exactly what `command_cache`'s already-documented
-    /// single-pass-streaming limitation means in practice here: `plane001`
-    /// is *not* cleanly recognized as a hit (the inserted `other` has no
-    /// counterpart anywhere in the old log, so it's reported as a plain
-    /// miss that supersedes whatever the log was positioned at - which is
-    /// `plane001`'s own old entry, since nothing has been consumed yet).
-    /// What this test actually proves is the thing this spike was *really*
-    /// for: `PlaneSetColor`'s content hash correctly tracks `plane001`'s
-    /// *current* content id after it's forced through this path, so the
-    /// two decisions stay consistent with each other (both correctly
-    /// re-sent together) rather than `PlaneSetColor` silently referencing a
-    /// stale or mismatched plane id.
+    /// The harder case - an unrelated statement inserted *before*
+    /// `plane001` shifts the deterministic id-generator counter, so
+    /// `plane001`'s *interpreter* id necessarily differs between runs. This
+    /// used to also force a real recreate: `command_cache.rs`'s original
+    /// matcher decided supersession eagerly, the moment the inserted
+    /// `other` failed to match, before it could see that `plane001`'s own
+    /// content still existed later in the new sequence. That matcher was
+    /// replaced with an index-based one specifically to fix this (see
+    /// `command_cache.rs`'s module docs and its
+    /// `insertion_before_an_unchanged_tail_no_longer_forces_a_recreate`
+    /// test) - this test confirms the fix holds end-to-end, through the
+    /// real `std/planes.rs` call sites and the flush-time translation
+    /// step, not just at the unit level.
     #[tokio::test(flavor = "multi_thread")]
-    async fn command_cache_spike_insertion_before_plane_forces_a_consistent_recreate() {
+    async fn command_cache_spike_insertion_before_plane_is_reused_not_recreated() {
         let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
 
         let program_a = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
         let mut exec_state_a = ExecState::new(&ctx);
         let (main_ref_a, _) = ctx.run(&program_a, &mut exec_state_a).await.unwrap();
-        ctx.cache.finish_command_cache_round().await;
         let vars_a = exec_state_a.mod_local.variables(main_ref_a).unwrap();
-        let plane_id_a = match vars_a.get("plane001").unwrap() {
+        let interpreter_id_a = match vars_a.get("plane001").unwrap() {
             KclValue::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
+        let real_id_a = ctx
+            .cache
+            .real_id_of(interpreter_id_a)
+            .await
+            .expect("resolved by the root block's flush inside ctx.run()");
+        ctx.cache.finish_command_cache_round().await;
 
         let program_b = crate::Program::parse_no_errs(
             "other = offsetPlane(XZ, offset = 3mm)\nplane001 = offsetPlane(XY, offset = 5mm)\n",
@@ -5597,30 +5617,29 @@ solid7 = extrude(r7, length = width)
         .unwrap();
         let mut exec_state_b = ExecState::new(&ctx);
         let (main_ref_b, _) = ctx.run(&program_b, &mut exec_state_b).await.unwrap();
-        ctx.cache.finish_command_cache_round().await;
         let vars_b = exec_state_b.mod_local.variables(main_ref_b).unwrap();
-        let plane_id_b = match vars_b.get("plane001").unwrap() {
+        let interpreter_id_b = match vars_b.get("plane001").unwrap() {
             KclValue::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
+        let real_id_b = ctx
+            .cache
+            .real_id_of(interpreter_id_b)
+            .await
+            .expect("resolved by the root block's flush inside ctx.run()");
+        ctx.cache.finish_command_cache_round().await;
 
-        // The documented limitation: this is *not* equal, because the
-        // insertion pre-empts the match before `plane001`'s own content is
-        // ever consulted. Asserted explicitly (not just assumed) so this
-        // test fails loudly if that behavior ever changes.
-        assert_ne!(
-            plane_id_a, plane_id_b,
-            "known Phase 0 limitation: an insertion right before an unchanged item currently forces a recreate"
+        // The interpreter id does shift - `other`'s insertion moves
+        // plane001 to a later position in next_uuid()'s deterministic
+        // sequence. That's expected and fine; it's never sent anywhere.
+        assert_ne!(interpreter_id_a, interpreter_id_b);
+
+        // The *real* engine id must not: this is exactly the bug the
+        // index-based matcher fixes.
+        assert_eq!(
+            real_id_a, real_id_b,
+            "an insertion before an unrelated, unchanged plane should no longer force it to be recreated"
         );
-
-        // What actually matters: execution still succeeded (no error from a
-        // stale/mismatched id reference), and `plane001`'s own id in the
-        // *second* run's outcome is self-consistent - i.e. this run didn't
-        // end up in a torn state where `PlaneSetColor` referenced a
-        // different id than the one `plane001`'s value actually holds.
-        // (`make_offset_plane_in_engine` would have errored via `expect` on
-        // `content_id_of` if the substitution lookup had failed outright.)
-        assert_ne!(plane_id_b, uuid::Uuid::nil());
 
         ctx.close().await;
     }
