@@ -4,68 +4,82 @@
 //!
 //! Nothing calls into this module yet - it's the matching algorithm on its
 //! own, validated by its own tests, ahead of the separate work of wiring it
-//! into real `ModelingCmd` sending (see the surgical-delete follow-up plan).
-//! Hence the module-wide `dead_code` allow below.
+//! into real `ModelingCmd` sending (see the batch architecture plan at
+//! `.claude/plans/command-cache-batch-architecture.md`). Hence the
+//! module-wide `dead_code` allow below.
 //!
 //! This module is deliberately generic over what a "command" actually is
 //! (see [`CommandLog`]'s `Payload` type parameter): it implements only the
 //! matching *algorithm* - given a sequence of content ids from a previous
-//! run and a new sequence arriving one at a time, decide for each new one
-//! whether it's a hit (reuse the old result, nothing to send) or a miss
-//! (send it for real), and which old entries turned out to have no
-//! counterpart in the new run at all (delete them). Turning an actual
-//! `ModelingCmd`/response pair into a [`ContentId`], and acting on the
-//! decisions this module returns, is the job of its caller.
+//! run and a new sequence from this run, decide for each new one whether
+//! it's a hit (reuse the old result, nothing to send) or a miss (send it
+//! for real), and which old entries turned out to have no counterpart in
+//! the new run at all (delete them). Turning an actual `ModelingCmd`/
+//! response pair into a [`ContentId`], and acting on the decisions this
+//! module returns, is the job of its caller.
 //!
 //! # The matching algorithm
 //!
-//! A [`CommandLog`] holds the previous run's entries in their original
-//! order, plus an index from content id to the (ascending) queue of
-//! not-yet-consumed positions that have it. Feeding it the new run's content
-//! ids one at a time, in order, via [`CommandLog::match_next`]:
+//! A [`CommandLog`] holds the previous run's entries, indexed by content id
+//! (an ascending queue of positions per id, so duplicates pair up in the
+//! order they originally appeared - see [`CommandLog::match_next`]'s docs).
+//! Matching is **index-based, not position-based**: feed it this round's
+//! content ids, in any order (program order is the natural choice, but
+//! nothing here depends on it), via [`CommandLog::match_next`]. Each call
+//! looks the content id up in the index directly - no cursor, no notion of
+//! "where the log currently is" - and either finds and consumes the
+//! earliest not-yet-claimed old entry with that content id (a hit) or
+//! finds nothing (a miss, genuinely new content).
 //!
-//! - If the next new content id matches the entry the log is currently
-//!   positioned at (`cursor`), that's a direct hit: nothing was deleted,
-//!   reuse that entry, advance.
-//! - Otherwise, look the new content id up in the index. If it's found at
-//!   some later position, every old entry strictly between the cursor and
-//!   that position has no counterpart in the new run - they're superseded
-//!   (to be deleted) - and the found position is the hit.
-//! - If the content id isn't in the index at all, it's genuinely new (a
-//!   miss): the caller must send it for real. Whatever entry the log was
-//!   positioned at, if any, had no counterpart either and is superseded.
-//!
-//! Every position the log advances past is removed from the index as it's
-//! consumed, so a later new content id can never incorrectly match a
-//! position that's already been assigned a disposition (reused or deleted).
+//! Supersession is decided separately, by **exclusion once every new
+//! content id for the round has been fed in** ([`CommandLog::superseded`]):
+//! an old entry is superseded if and only if nothing in the complete new
+//! sequence ever claimed it. This is deliberately not decided eagerly at
+//! each mismatch - see the next section for why that distinction matters.
 //!
 //! This module does not know about ids being shared between two logically
 //! different objects (e.g. `extrude()` reusing its input's engine id) - a
 //! caller that cares about that must inspect what [`MatchDecision::Hit`]
-//! reuses and what it supersedes, and override a hit into a forced miss if
-//! something it's about to delete is also what a hit is relying on.
+//! reuses and cross-check it against [`CommandLog::superseded`]'s eventual
+//! result, and override a hit into a forced miss if something it's about
+//! to delete is also what a hit is relying on.
 //!
-//! # A known, deliberate limitation: insertions before an unchanged tail
+//! # Why index-based beats position-based, and what it still doesn't fix
 //!
-//! This is a true single-pass streaming match: new content ids arrive one
-//! at a time, and a decision is made immediately, without buffering or
-//! looking ahead into new content that hasn't been computed yet (doing so
-//! would mean running the interpreter further ahead speculatively, which
-//! isn't free the way looking ahead into the already-fully-known old log
-//! is). So when a new content id doesn't match `old_log[cursor]` and isn't
-//! found anywhere later in the old log either, this is reported as a miss
-//! that supersedes `old_log[cursor]` - there's no way, at that point, to
-//! tell "this is genuinely new content, unrelated to anything, and
-//! `old_log[cursor]` will turn out to still be needed a moment later"
-//! (a pure insertion) apart from "this is what replaced `old_log[cursor]`"
-//! (the case the worked example in the module's design doc is about) -
-//! both look identical from this algorithm's point of view at the moment
-//! of the mismatch. The practical effect: an item inserted just before an
-//! otherwise-unchanged tail causes the one shifted item right after it to
-//! be needlessly deleted and recreated (with a fresh id) a step later,
-//! instead of being left alone. This costs one avoidable round trip; it
-//! does not produce an incorrect final result, since the recreated item's
-//! content is identical to what was there before.
+//! An earlier version of this module matched by cursor position, falling
+//! back to an index lookup only on a mismatch, and decided supersession
+//! eagerly at that mismatch rather than by exclusion at the end. That
+//! turned out to be a real bug, not just a missed optimization: replaying
+//! `[a, b]` against a new sequence `[a, x, b]` (an unrelated item `x`
+//! inserted before an otherwise-unchanged `b`) would match `a` directly,
+//! then see `x` match nothing at the cursor *or* anywhere later in the old
+//! log, and - having no way to look ahead into the new sequence, which
+//! hadn't been computed yet - conservatively treat old `b` as superseded
+//! right then. A step later, `b` would reappear and be reported as a fresh
+//! miss: a needless delete-and-recreate for something that never actually
+//! changed. Precomputing the new sequence ahead of time did not fix this on
+//! its own, because the old algorithm never looked ahead into it regardless
+//! of whether the caller already had it - the bug was in *when* supersession
+//! got decided, not in whether matching was streamed or batched.
+//!
+//! The fix above removes this entirely: matching `[a, x, b]` against old
+//! `[a, b]` by index, then excluding only what's left unclaimed at the end,
+//! correctly hits both `a` and `b` and reports nothing superseded. It also
+//! makes a pure reorder free (`[a, b, c]` against old `[c, a, b]` hits all
+//! three), which the old algorithm could not do either.
+//!
+//! **What this does *not* fix**: two old entries with *identical* creation
+//! content that have since diverged via a later mutation (e.g. ten
+//! identical `MakePlane`s, exactly one of which later got a `PlaneSetColor`)
+//! are still indistinguishable to this module, because it only ever
+//! compares one command's content at a time - it has no notion of an
+//! entity's accumulated history. Content-identical siblings still pair up
+//! by FIFO queue order within [`CommandLog`]'s index (see the
+//! `duplicate_content_pairs_with_earliest_unconsumed_occurrence_first`
+//! test below), which is safe only as long as nothing has actually told
+//! them apart yet.
+//! Fixing that needs per-entity chained content identity, not a change to
+//! this matcher - see the design note's SS3.2 and SS3.5, and its step 3.
 
 #![allow(dead_code)]
 
@@ -101,32 +115,32 @@ pub(crate) struct LogEntry<Payload> {
 }
 
 /// The result of matching one new content id against a [`CommandLog`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Neither variant carries supersession information - that's decided
+/// separately, once, by [`CommandLog::superseded`] after every new content
+/// id for the round has gone through [`CommandLog::match_next`]. See the
+/// module docs for why eagerly deciding supersession per-call (an earlier
+/// version of this type did) was the actual bug, not just an API wrinkle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MatchDecision {
-    /// The new content id matches the entry at `old_index`; reuse it, no
-    /// need to send anything for it. Every index in `superseded` (always in
-    /// ascending order, all less than `old_index`) was skipped over to find
-    /// this match - those old entries have no counterpart in the new run
-    /// and should be deleted.
-    Hit { old_index: usize, superseded: Vec<usize> },
+    /// The new content id matched the entry at `old_index`; reuse it, no
+    /// need to send anything for it.
+    Hit { old_index: usize },
     /// Nothing in the log matches this content id; the caller must send it
-    /// for real. `superseded`, if present, is the old entry the log was
-    /// positioned at - it has no counterpart in the new run either and
-    /// should be deleted.
-    Miss { superseded: Option<usize> },
+    /// for real.
+    Miss,
 }
 
-/// The previous run's ordered command log, with an index for matching new
-/// content ids against it in O(1) instead of scanning. See the module docs
-/// for the matching algorithm.
+/// The previous run's command log, indexed by content id for O(1) matching
+/// instead of scanning. See the module docs for the matching algorithm.
 #[derive(Debug)]
 pub(crate) struct CommandLog<Payload> {
     entries: Vec<LogEntry<Payload>>,
     /// For each content id, the ascending queue of positions in `entries`
-    /// that have it and haven't been consumed (assigned a disposition) yet.
+    /// that have it and haven't been claimed by anything in this round's
+    /// sequence yet. Shrinks as `match_next` consumes positions; whatever
+    /// remains once the whole round has been fed in has no counterpart in
+    /// the new run - see [`Self::superseded`].
     index: HashMap<ContentId, VecDeque<usize>>,
-    /// The next not-yet-consumed position in `entries`, if any.
-    cursor: usize,
 }
 
 impl<Payload> CommandLog<Payload> {
@@ -136,11 +150,7 @@ impl<Payload> CommandLog<Payload> {
         for (position, entry) in entries.iter().enumerate() {
             index.entry(entry.content_id).or_default().push_back(position);
         }
-        Self {
-            entries,
-            index,
-            cursor: 0,
-        }
+        Self { entries, index }
     }
 
     /// The payload at a given position. Only ever called by a caller with a
@@ -150,49 +160,32 @@ impl<Payload> CommandLog<Payload> {
         &self.entries[position].payload
     }
 
-    /// Match the next content id from the new run against this log. See the
-    /// module docs for what each outcome means and the caller's
-    /// responsibilities (sending a miss for real, deleting what's
-    /// superseded).
+    /// Match one new content id against this log by index lookup alone -
+    /// no cursor, no position dependence. On a hit, consumes the earliest
+    /// not-yet-claimed old entry with this content id (so two new
+    /// occurrences of the same content pair with the old ones in the order
+    /// they originally appeared, not both matching the same position - see
+    /// the `duplicate_content_...` test below).
     pub(crate) fn match_next(&mut self, content_id: ContentId) -> MatchDecision {
-        if self.cursor < self.entries.len() && self.entries[self.cursor].content_id == content_id {
-            let old_index = self.cursor;
-            self.consume(old_index);
-            self.cursor += 1;
-            return MatchDecision::Hit {
-                old_index,
-                superseded: Vec::new(),
-            };
+        match self.take_earliest(&content_id) {
+            Some(old_index) => MatchDecision::Hit { old_index },
+            None => MatchDecision::Miss,
         }
-
-        if let Some(found_index) = self.take_earliest(&content_id) {
-            // Invariant: nothing before `self.cursor` remains in the index
-            // (every position the cursor has passed was consumed), and the
-            // direct-hit check above already ruled out `found_index ==
-            // self.cursor`, so `found_index > self.cursor` here.
-            let superseded: Vec<usize> = (self.cursor..found_index).collect();
-            for &position in &superseded {
-                self.consume(position);
-            }
-            self.cursor = found_index + 1;
-            return MatchDecision::Hit {
-                old_index: found_index,
-                superseded,
-            };
-        }
-
-        let superseded = if self.cursor < self.entries.len() {
-            let position = self.cursor;
-            self.consume(position);
-            self.cursor += 1;
-            Some(position)
-        } else {
-            None
-        };
-        MatchDecision::Miss { superseded }
     }
 
-    /// Pop and return the earliest not-yet-consumed position with this
+    /// Every old position that no content id in this round's sequence ever
+    /// claimed, in ascending order. Call this only after every new content
+    /// id for the round has already gone through [`Self::match_next`] -
+    /// calling it mid-round would report positions as superseded that
+    /// simply haven't been matched *yet*. These have no counterpart in the
+    /// new run and should be deleted.
+    pub(crate) fn superseded(&self) -> Vec<usize> {
+        let mut positions: Vec<usize> = self.index.values().flatten().copied().collect();
+        positions.sort_unstable();
+        positions
+    }
+
+    /// Pop and return the earliest not-yet-claimed position with this
     /// content id, if any.
     fn take_earliest(&mut self, content_id: &ContentId) -> Option<usize> {
         let queue = self.index.get_mut(content_id)?;
@@ -201,22 +194,6 @@ impl<Payload> CommandLog<Payload> {
             self.index.remove(content_id);
         }
         position
-    }
-
-    /// Remove a specific position from its content id's queue, marking it
-    /// as having been assigned a disposition (reused or deleted) so it can
-    /// never be matched again.
-    fn consume(&mut self, position: usize) {
-        let content_id = self.entries[position].content_id;
-        let Some(queue) = self.index.get_mut(&content_id) else {
-            return;
-        };
-        if let Some(queue_position) = queue.iter().position(|&p| p == position) {
-            queue.remove(queue_position);
-        }
-        if queue.is_empty() {
-            self.index.remove(&content_id);
-        }
     }
 }
 
@@ -253,8 +230,8 @@ impl CommandCacheRound {
     ) -> (uuid::Uuid, bool) {
         let (real_id, is_hit) = match old_log {
             Some(log) => match log.match_next(content_id) {
-                MatchDecision::Hit { old_index, .. } => (*log.payload(old_index), true),
-                MatchDecision::Miss { .. } => (mint_fresh(), false),
+                MatchDecision::Hit { old_index } => (*log.payload(old_index), true),
+                MatchDecision::Miss => (mint_fresh(), false),
             },
             None => (mint_fresh(), false),
         };
@@ -897,165 +874,132 @@ mod tests {
                 decision,
                 MatchDecision::Hit {
                     old_index: ["a", "b", "c"].iter().position(|&l| l == label).unwrap(),
-                    superseded: vec![],
                 }
             );
         }
+        assert_eq!(log.superseded(), Vec::<usize>::new());
     }
 
     #[test]
-    fn pure_trailing_append_is_misses_with_nothing_superseded() {
+    fn pure_trailing_append_is_a_miss_with_nothing_superseded() {
         let mut log = log_of(&["a", "b"]);
-        assert_eq!(
-            log.match_next(id("a")),
-            MatchDecision::Hit {
-                old_index: 0,
-                superseded: vec![]
-            }
-        );
-        assert_eq!(
-            log.match_next(id("b")),
-            MatchDecision::Hit {
-                old_index: 1,
-                superseded: vec![]
-            }
-        );
-        // Nothing left in the old log: a pure miss, nothing superseded.
-        assert_eq!(log.match_next(id("c")), MatchDecision::Miss { superseded: None });
+        assert_eq!(log.match_next(id("a")), MatchDecision::Hit { old_index: 0 });
+        assert_eq!(log.match_next(id("b")), MatchDecision::Hit { old_index: 1 });
+        // Nothing left in the old log: a pure miss.
+        assert_eq!(log.match_next(id("c")), MatchDecision::Miss);
+        // Both old entries were claimed; nothing superseded.
+        assert_eq!(log.superseded(), Vec::<usize>::new());
     }
 
     #[test]
-    fn pure_trailing_delete_supersedes_the_tail_one_at_a_time() {
+    fn pure_trailing_delete_is_superseded_once_the_round_ends() {
         // Old log has a trailing "b" that the new run never produces.
         let mut log = log_of(&["a", "b"]);
-        assert_eq!(
-            log.match_next(id("a")),
-            MatchDecision::Hit {
-                old_index: 0,
-                superseded: vec![]
-            }
-        );
-        // Nothing more arrives from the new run; the caller is responsible
-        // for deciding "b" (never matched) is superseded once execution
-        // ends, same as today's trailing-delete case - this module only
-        // reports supersession discovered *during* matching (point of the
-        // worked example below), not log entries nobody ever asked about.
+        assert_eq!(log.match_next(id("a")), MatchDecision::Hit { old_index: 0 });
+        // Nothing more arrives from the new run. "b" was never claimed, so
+        // it shows up as superseded once the caller asks, after feeding in
+        // everything this round actually produced.
+        assert_eq!(log.superseded(), vec![1]);
     }
 
     #[test]
-    fn worked_example_mid_log_replacement_is_detected_before_the_new_create() {
+    fn worked_example_mid_log_replacement_is_detected_by_the_time_the_round_ends() {
         // Mirrors the task's worked example: ten entries, the first three
-        // unchanged, the fourth changed in place (still a "miss" at that
-        // position, nothing superseded since nothing later matches it
-        // either), and the fifth replaced by brand new content that never
-        // appears later in the old log.
+        // unchanged, the fourth changed in place, and the fifth replaced by
+        // brand new content that never appears anywhere else in the old log.
         let mut log = log_of(&["1", "2", "3", "4", "5.1", "6", "7", "8", "9", "10"]);
 
         for label in ["1", "2", "3"] {
-            assert!(
-                matches!(log.match_next(id(label)), MatchDecision::Hit { superseded, .. } if superseded.is_empty())
-            );
+            assert!(matches!(log.match_next(id(label)), MatchDecision::Hit { .. }));
         }
 
-        // Position 4's content changed; "4-new" appears nowhere else in the
-        // old log, so it's a miss, and the old "4" is superseded.
-        assert_eq!(log.match_next(id("4-new")), MatchDecision::Miss { superseded: Some(3) });
-
-        // Position 5: "5.2" replaces "5.1". "5.1" never recurs later in the
-        // old log, so this is detected right here, as a miss superseding
-        // position 4 ("5.1") - before any create for "5.2" would be sent,
-        // matching the task's requirement.
-        assert_eq!(log.match_next(id("5.2")), MatchDecision::Miss { superseded: Some(4) });
+        // "4-new" and "5.2" appear nowhere in the old log: both misses.
+        assert_eq!(log.match_next(id("4-new")), MatchDecision::Miss);
+        assert_eq!(log.match_next(id("5.2")), MatchDecision::Miss);
 
         // Everything from "6" onward is unchanged and still matches by
-        // direct position.
+        // content, found directly via the index.
         for (expected_index, label) in [(5, "6"), (6, "7"), (7, "8"), (8, "9"), (9, "10")] {
             assert_eq!(
                 log.match_next(id(label)),
                 MatchDecision::Hit {
-                    old_index: expected_index,
-                    superseded: vec![],
+                    old_index: expected_index
                 }
             );
         }
+
+        // Old "4" (position 3) and old "5.1" (position 4) were never
+        // claimed by anything in the new sequence - superseded, in order,
+        // once the whole round is in.
+        assert_eq!(log.superseded(), vec![3, 4]);
     }
 
     #[test]
     fn deletion_cluster_in_the_middle_is_found_via_the_index_not_a_scan() {
         // "b" and "c" are deleted together; "a" and "d" survive unchanged.
         let mut log = log_of(&["a", "b", "c", "d"]);
-        assert_eq!(
-            log.match_next(id("a")),
-            MatchDecision::Hit {
-                old_index: 0,
-                superseded: vec![]
-            }
-        );
-        assert_eq!(
-            log.match_next(id("d")),
-            MatchDecision::Hit {
-                old_index: 3,
-                superseded: vec![1, 2],
-            }
-        );
+        assert_eq!(log.match_next(id("a")), MatchDecision::Hit { old_index: 0 });
+        assert_eq!(log.match_next(id("d")), MatchDecision::Hit { old_index: 3 });
+        assert_eq!(log.superseded(), vec![1, 2]);
     }
 
     #[test]
-    fn insertion_before_an_unchanged_tail_costs_one_avoidable_recreate_not_correctness() {
-        // "x" is inserted between "a" and "b". This is the one honest
-        // limitation of a true single-pass streaming match: when "x"
-        // doesn't match `old[cursor]` ("b") and isn't found anywhere else
-        // in the (fully known) old log either, there's no way to tell
-        // "b" apart from a genuine replacement without looking ahead into
-        // new content that hasn't been computed yet - which a streaming
-        // match can't do. So "b" is conservatively treated as superseded
-        // here, then recreated (with a fresh id) a step later when it's
-        // seen again. The end state is still correct; this just costs one
-        // avoidable delete+recreate for "b" instead of leaving it alone.
+    fn insertion_before_an_unchanged_tail_no_longer_forces_a_recreate() {
+        // "x" is inserted between "a" and "b". This is exactly the case an
+        // earlier, position-based version of this matcher got wrong: it
+        // would see "x" fail to match at the cursor (where "b" was) and,
+        // having no way to look ahead into content it hadn't been fed yet,
+        // conservatively treat "b" as superseded right then - a needless
+        // delete-and-recreate for something that never actually changed.
+        // Matching by index instead of position fixes this outright: "b"'s
+        // content still exists in the old log regardless of where the
+        // cursor would have been, so it's found and reused directly.
         let mut log = log_of(&["a", "b"]);
-        assert_eq!(
-            log.match_next(id("a")),
-            MatchDecision::Hit {
-                old_index: 0,
-                superseded: vec![]
-            }
-        );
-        assert_eq!(log.match_next(id("x")), MatchDecision::Miss { superseded: Some(1) });
-        assert_eq!(log.match_next(id("b")), MatchDecision::Miss { superseded: None });
+        assert_eq!(log.match_next(id("a")), MatchDecision::Hit { old_index: 0 });
+        assert_eq!(log.match_next(id("x")), MatchDecision::Miss); // genuinely new
+        assert_eq!(log.match_next(id("b")), MatchDecision::Hit { old_index: 1 }); // reused, not recreated
+        assert_eq!(log.superseded(), Vec::<usize>::new()); // nothing deleted
+    }
+
+    #[test]
+    fn pure_reorder_reuses_everything() {
+        // A stronger case than insertion: every old entry survives, just in
+        // a different order. Index-based matching doesn't care about order
+        // at all, so all three are hits and nothing is superseded.
+        let mut log = log_of(&["a", "b", "c"]);
+        assert_eq!(log.match_next(id("c")), MatchDecision::Hit { old_index: 2 });
+        assert_eq!(log.match_next(id("a")), MatchDecision::Hit { old_index: 0 });
+        assert_eq!(log.match_next(id("b")), MatchDecision::Hit { old_index: 1 });
+        assert_eq!(log.superseded(), Vec::<usize>::new());
     }
 
     #[test]
     fn duplicate_content_pairs_with_earliest_unconsumed_occurrence_first() {
         // Two separately-created objects that happen to be identical. Two
         // new occurrences of that same content should pair with the old
-        // ones in order, not both match the same old position.
+        // ones in order, not both match the same old position. This is the
+        // one thing index-based matching does *not* fix on its own - see
+        // the module docs' section on what's still unresolved until entity
+        // chaining (design note SS3.2) exists: this is only safe as long as
+        // nothing has mutated one of the duplicates differently from the
+        // others.
         let mut log = log_of(&["x", "x"]);
-        assert_eq!(
-            log.match_next(id("x")),
-            MatchDecision::Hit {
-                old_index: 0,
-                superseded: vec![],
-            }
-        );
-        assert_eq!(
-            log.match_next(id("x")),
-            MatchDecision::Hit {
-                old_index: 1,
-                superseded: vec![],
-            }
-        );
+        assert_eq!(log.match_next(id("x")), MatchDecision::Hit { old_index: 0 });
+        assert_eq!(log.match_next(id("x")), MatchDecision::Hit { old_index: 1 });
+        assert_eq!(log.superseded(), Vec::<usize>::new());
     }
 
     #[test]
     fn a_consumed_position_is_never_matched_again() {
         // Regression guard for the bookkeeping this module exists to get
-        // right: once a position has been assigned a disposition, nothing
-        // later can accidentally match it again.
+        // right: once a position has been claimed, nothing later can
+        // accidentally match it again.
         let mut log = log_of(&["x", "y"]);
         let _ = log.match_next(id("x")); // consumes position 0
         // A later, unrelated miss must not accidentally resurrect position
         // 0 just because some future content happens to hash the same.
-        let _ = log.match_next(id("z")); // miss, supersedes position 1 ("y")
-        assert_eq!(log.match_next(id("x")), MatchDecision::Miss { superseded: None });
+        let _ = log.match_next(id("z")); // miss; "y" (position 1) stays unclaimed
+        assert_eq!(log.match_next(id("x")), MatchDecision::Miss);
+        assert_eq!(log.superseded(), vec![1]);
     }
 }

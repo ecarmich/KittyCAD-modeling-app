@@ -446,11 +446,19 @@ types before implementation, not assumed from this doc.
 1. **Done.** `IdRefs` trait + the per-variant match (§3.4), tested standalone
    against synthetic `ModelingCmd` values — no wiring into execution yet,
    same spirit as `command_cache.rs`'s own introduction.
-2. The corrected matcher (§3.2): index-based hit/miss, exclusion-based
-   supersession, no entity chaining yet — tested against the original
-   insertion/reordering cases (including the already-existing
-   `insertion_before_an_unchanged_tail_...` test, which should now assert the
-   *opposite* of what it asserts today) before touching chains at all.
+2. **Done.** The corrected matcher (§3.2): index-based hit/miss,
+   exclusion-based supersession via a new `CommandLog::superseded`, no
+   entity chaining yet. `MatchDecision` dropped its per-call `superseded`
+   fields entirely (supersession is decided once, at the end, not per
+   match) and `CommandLog` dropped `cursor`/`consume` - the corrected
+   algorithm is simpler than the one it replaced, not more complex. The
+   pre-existing `insertion_before_an_unchanged_tail_...` test now asserts
+   the opposite of what it did before (reused, not recreated) and is
+   renamed accordingly; a new `pure_reorder_reuses_everything` test covers
+   the strictly-stronger case index-based matching also gets for free.
+   `duplicate_content_pairs_with_earliest_unconsumed_occurrence_first`
+   stays green but its doc comment now points at what it *doesn't* cover
+   (divergent mutation among duplicates - step 3's job).
 3. Entity-chained content identity (§3.2) and the duplicate-content test from
    §3.5, generalizing the before-send path (today: `MakePlane`/
    `PlaneSetColor` only, by hand) to use `IdRefs` + the effect classification
