@@ -45,6 +45,7 @@ use crate::execution::ProgramLookup;
 use crate::execution::SketchVarId;
 use crate::execution::UnsolvedSegment;
 use crate::execution::annotations;
+use crate::execution::cache::translate_kcl_value_ids;
 use crate::execution::cad_op::Operation;
 use crate::execution::id_generator::IdGenerator;
 #[cfg(test)]
@@ -789,9 +790,23 @@ impl ExecState {
     ) -> Result<ExecOutcome, KclError> {
         // Fields are opt-in so that we don't accidentally leak private internal
         // state when we add more to ExecState.
-        let variables = self.mod_local.variables(main_ref)?;
+        let mut variables = self.mod_local.variables(main_ref)?;
         #[cfg(test)]
         let test_program_memory = variables.clone();
+
+        // Translate any interpreter id the deferred content-cache mechanism
+        // (see `execution::command_cache`'s SS2) left bound into a KclValue
+        // (today: only offsetPlane's planes) back to the real engine id
+        // before it crosses out of kcl-lib. A no-op for every id that was
+        // never part of that mechanism.
+        let resolved = ctx.cache.resolved_entity_ids().await;
+        if !resolved.is_empty() {
+            let translate = |id: Uuid| resolved.get(&id).copied().unwrap_or(id);
+            for value in variables.values_mut() {
+                translate_kcl_value_ids(value, &translate);
+            }
+        }
+
         let variables = variables
             .into_iter()
             .map(|(key, value)| (key, KclValueView::from(value)))

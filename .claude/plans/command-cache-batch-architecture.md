@@ -432,12 +432,13 @@ or even unchanged-but-freshly-resent inputs.
 ## 5. The output-boundary translation problem
 
 Flagged by the task background as "completely undesigned." Narrower than
-feared once traced:
+feared once traced, and now **half done**:
 
 - `kcl_api::Object` (`scene_objects`, `source_range_to_object`) does **not**
   carry a real engine id at all — `Object.id: ObjectId` is a local `usize`
   bookkeeping id and `Object.artifact_id: ArtifactId` is a third, separate id
   space (`rust/kcl-api/src/front.rs:27`). Nothing to translate there.
+  Unchanged by anything below.
 - `ArtifactGraph` is already built as a single end-of-execution batch pass
   over the full `ArtifactCommand` log plus flattened engine responses
   (`state.rs::build_artifact_graph` ~1428, `artifact.rs::build_artifact_graph`
@@ -447,23 +448,37 @@ feared once traced:
   more likely, leave the graph itself keyed on interpreter ids internally
   and only translate at serialization to the frontend, if anything downstream
   of it needs a real id at all — needs checking against what the frontend
-  actually consumes from artifact graph nodes).
-- `ExecOutcome.variables: IndexMap<String, KclValueView>` is the real
-  surface: every `Solid`/`Sketch`/`Plane`/`Helix`/`ImportedGeometry`/
-  `GdtAnnotation`'s `.id` embedded in program memory, exposed directly to the
-  frontend. This needs a recursive rewrite pass over every `KclValueView`
-  before `into_exec_outcome` (`cache.rs:232`) returns — and
-  `cache.rs::kcl_value_referenced_ids` (`cache.rs:634`, already written for
-  the surgical-delete alias check) is *already* exactly this traversal
-  shape, just collecting instead of mutating. Reuse it (or a `KclValueView`-
-  typed sibling of it) rather than writing a second one.
+  actually consumes from artifact graph nodes). **Still not done** - the
+  artifact graph (and therefore an offsetPlane's node in it) may still carry
+  the interpreter id; this needs the same direct read of `artifact.rs`'s
+  graph node types the original note called for, before implementing it.
+- `ExecOutcome.variables: IndexMap<String, KclValueView>` **— done.** Every
+  `Solid`/`Sketch`/`Plane`/`Helix`/`ImportedGeometry`/`GdtAnnotation`'s `.id`
+  (and `.artifact_id` for `Plane`/`Helix`, which the established codebase
+  convention - see `std/sketch.rs`'s `ensure_sketch_plane_in_engine`, which
+  always sets `artifact_id = id.into()` - ties to the same value as `.id`,
+  so translating one without the other would have desynced them) is now
+  rewritten in place before either of the two `into_exec_outcome`
+  implementations returns (`state.rs`'s, which is the one most real callers
+  use, and `cache.rs`'s `GlobalState` version). `cache.rs::kcl_value_referenced_ids`
+  (already written for the surgical-delete alias check) turned out to be
+  exactly the right traversal shape to copy, as predicted - its new sibling
+  `translate_kcl_value_ids` mutates in place instead of collecting, with a
+  `translate: impl Fn(Uuid) -> Uuid` that's the identity function for
+  anything not part of the deferred mechanism (everything except
+  `offsetPlane`'s planes today), fed from `Cache::resolved_entity_ids`.
+  Verified with a new end-to-end test
+  (`command_cache_spike_exec_outcome_exposes_the_real_id_not_the_interpreter_id`)
+  that exercises `ExecState::into_exec_outcome` itself, not just the
+  pre-translation state the other two spike tests read directly.
 
-Net: the output-boundary problem is two call sites (`build_artifact_graph`'s
-inputs, and a rewrite pass before `into_exec_outcome`), not a sprawling
-audit — contingent on confirming `ArtifactGraph`'s own node payloads don't
-embed raw engine `Uuid`s anywhere outside what `build_artifact_graph`
-already controls, which needs a direct read of `artifact.rs`'s graph node
-types before implementation, not assumed from this doc.
+Net: the output-boundary problem was two call sites, as predicted. One
+(`ExecOutcome.variables`) is done; the other (`build_artifact_graph`'s
+inputs) is not, and is the one remaining known gap for `offsetPlane` - its
+artifact-graph node may still be addressed by interpreter id rather than
+the real one, which could show up as a mismatch anywhere the frontend
+correlates a KCL value's (now-correct) real id against the artifact graph's
+(still interpreter-addressed) one for an offsetPlane specifically.
 
 ## 6. Suggested implementation order
 
@@ -530,15 +545,15 @@ types before implementation, not assumed from this doc.
      network access this environment doesn't have, confirmed unrelated by
      inspecting their panics), and the one test this step actually changes
      the behavior of flips from failing to passing only on this branch.
-5. Output-boundary rewrite (§5): still not done. `ExecOutcome.variables`
-   now really does carry interpreter ids for `offsetPlane`'s planes (not
-   just a theoretical future concern) - nothing downstream translates them
-   back to real ids yet. Low blast radius today only because the two
-   affected end-to-end tests read `Cache::real_id_of` directly instead of
-   going through `ExecOutcome`; a real caller reading `KclValueView`
-   normally would see the wrong (interpreter, not real) id for an
-   offsetPlane's plane. This is now a real, live gap, not a hypothetical
-   one - next in line.
+5. **Partly done.** Output-boundary rewrite (§5): `ExecOutcome.variables` is
+   fixed - both `into_exec_outcome` implementations now translate
+   interpreter ids back to real ids via the new `translate_kcl_value_ids`,
+   verified end-to-end (see §5 above). **Still open:** `ArtifactGraph` -
+   `build_artifact_graph`'s own inputs/outputs were not touched, so an
+   offsetPlane's artifact-graph node may still be interpreter-addressed
+   while the same plane's `KclValueView` is now correctly real-id-addressed.
+   Whether this actually matters depends on what the frontend does with
+   artifact graph node ids for a plane specifically - not yet checked.
 6. Response caching (§4): separate follow-up, not a prerequisite for 1-5.
 
 Each step should land as its own reviewable commit with its own tests, same

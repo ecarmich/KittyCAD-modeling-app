@@ -283,9 +283,23 @@ impl GlobalState {
     pub async fn into_exec_outcome(self, ctx: &ExecutorContext) -> Result<ExecOutcome, KclError> {
         // Fields are opt-in so that we don't accidentally leak private internal
         // state when we add more to ExecState.
-        let variables = self.main.exec_state.variables(self.main.result_env)?;
+        let mut variables = self.main.exec_state.variables(self.main.result_env)?;
         #[cfg(test)]
         let test_program_memory = variables.clone();
+
+        // Translate any interpreter id the deferred content-cache mechanism
+        // left bound into a KclValue (today: only offsetPlane's planes)
+        // back to the real engine id before it crosses out of kcl-lib. A
+        // no-op (the lookup below just finds nothing) for every id that was
+        // never part of that mechanism.
+        let resolved = ctx.cache.resolved_entity_ids().await;
+        if !resolved.is_empty() {
+            let translate = |id: Uuid| resolved.get(&id).copied().unwrap_or(id);
+            for value in variables.values_mut() {
+                translate_kcl_value_ids(value, &translate);
+            }
+        }
+
         let variables = variables
             .into_iter()
             .map(|(key, value)| (key, KclValueView::from(value)))
@@ -715,6 +729,75 @@ fn kcl_value_referenced_ids(value: &KclValue, ids: &mut HashSet<Uuid>) {
             #[allow(clippy::iter_over_hash_type)]
             for element in value.values() {
                 kcl_value_referenced_ids(element, ids);
+            }
+        }
+        KclValue::Bool { .. }
+        | KclValue::Number { .. }
+        | KclValue::String { .. }
+        | KclValue::Enum { .. }
+        | KclValue::TagIdentifier(_)
+        | KclValue::TagDeclarator(_)
+        | KclValue::KclNone { .. }
+        | KclValue::SketchVar { .. }
+        | KclValue::SketchConstraint { .. }
+        | KclValue::Face { .. }
+        | KclValue::BoundedEdge { .. }
+        | KclValue::Segment { .. }
+        | KclValue::CameraView { .. }
+        | KclValue::NamedView { .. }
+        | KclValue::Function { .. }
+        | KclValue::Module { .. }
+        | KclValue::Type { .. } => {}
+    }
+}
+
+/// The output-boundary counterpart to [`kcl_value_referenced_ids`]: the same
+/// variants, but rewriting each engine id in place via `translate` instead
+/// of collecting it. Exists because `execution::command_cache`'s deferred
+/// content-cache mechanism (see its SS2) binds an *interpreter* id into a
+/// `KclValue` immediately and never rewrites it there - something has to
+/// translate it to the *real* engine id before the value crosses out of
+/// kcl-lib (into [`ExecOutcome`]), or a caller outside this crate sees an id
+/// that was never actually sent to the engine.
+///
+/// Also translates `artifact_id` for the kinds that carry one (`Plane`,
+/// `Helix`) - the established convention across this codebase (see e.g.
+/// `std/sketch.rs`'s `ensure_sketch_plane_in_engine`, `std/planes.rs`'s
+/// `make_offset_plane_in_engine`) is that `artifact_id` always equals the
+/// engine id directly for those kinds; translating `id` without also
+/// translating `artifact_id` would desync an invariant the rest of the
+/// codebase relies on.
+///
+/// `translate` should be the identity function for any id that was never
+/// part of the deferred mechanism - true for everything except
+/// `offsetPlane`'s planes today (see [`Cache::resolved_entity_ids`] and its
+/// callers, `GlobalState::into_exec_outcome` here and
+/// `state::ExecState::into_exec_outcome`, the one most real callers use).
+pub(super) fn translate_kcl_value_ids(value: &mut KclValue, translate: &impl Fn(Uuid) -> Uuid) {
+    match value {
+        KclValue::Solid { value } => value.id = translate(value.id),
+        KclValue::Sketch { value } => value.id = translate(value.id),
+        KclValue::Plane { value } => {
+            value.id = translate(value.id);
+            value.artifact_id = translate(Uuid::from(value.artifact_id)).into();
+        }
+        KclValue::Helix { value } => {
+            value.value = translate(value.value);
+            value.artifact_id = translate(Uuid::from(value.artifact_id)).into();
+        }
+        KclValue::GdtAnnotation { value } => value.id = translate(value.id),
+        KclValue::ImportedGeometry(value) => value.id = translate(value.id),
+        KclValue::Uuid { value, .. } => *value = translate(*value),
+        KclValue::HomArray { value, .. } | KclValue::Tuple { value, .. } => {
+            for element in value.iter_mut() {
+                translate_kcl_value_ids(element, translate);
+            }
+        }
+        KclValue::Object { value, .. } => {
+            // Order doesn't matter: each element is translated independently.
+            #[allow(clippy::iter_over_hash_type)]
+            for element in value.values_mut() {
+                translate_kcl_value_ids(element, translate);
             }
         }
         KclValue::Bool { .. }

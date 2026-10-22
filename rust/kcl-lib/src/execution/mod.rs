@@ -5644,6 +5644,53 @@ solid7 = extrude(r7, length = width)
         ctx.close().await;
     }
 
+    /// Closes the output-boundary gap step 4 of the design note opened:
+    /// before this, an offsetPlane's `.id`/`.artifactId` as exposed through
+    /// `ExecOutcome` held the *interpreter* id, never translated back to
+    /// the real engine id - silently wrong for anything outside kcl-lib
+    /// that expects a KCL plane's id to correlate with the actual engine
+    /// object. This exercises `ExecState::into_exec_outcome` itself (the
+    /// path most real callers use - the other two tests above read
+    /// `exec_state.mod_local.variables` directly, which bypasses it) and
+    /// confirms it now resolves the real id, not the interpreter one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_cache_spike_exec_outcome_exposes_the_real_id_not_the_interpreter_id() {
+        let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
+        let program = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
+
+        let mut exec_state = ExecState::new(&ctx);
+        let (main_ref, _) = ctx.run(&program, &mut exec_state).await.unwrap();
+
+        // Ground truth, read the same way the other two tests here do,
+        // bypassing translation entirely.
+        let vars = exec_state.mod_local.variables(main_ref).unwrap();
+        let interpreter_id = match vars.get("plane001").unwrap() {
+            KclValue::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+        let real_id = ctx
+            .cache
+            .real_id_of(interpreter_id)
+            .await
+            .expect("resolved by the root block's flush inside ctx.run()");
+        assert_ne!(
+            interpreter_id, real_id,
+            "this test is only meaningful if the two ids actually differ"
+        );
+
+        let outcome = exec_state.into_exec_outcome(main_ref, &ctx).await.unwrap();
+        let outcome_id = match outcome.variables.get("plane001").unwrap() {
+            KclValueView::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+        assert_eq!(
+            outcome_id, real_id,
+            "ExecOutcome must expose the real engine id, not the interpreter id"
+        );
+
+        ctx.close().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cached_execution_phases_preserve_edits_settings_and_error_recovery() {
         let mut ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
