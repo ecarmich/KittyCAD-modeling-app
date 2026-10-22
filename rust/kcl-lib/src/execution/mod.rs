@@ -2647,7 +2647,10 @@ impl ExecutorContext {
         // and should be dropped.
         self.engine.clear_queues(&self.engine_batch).await;
 
-        match exec_state.build_artifact_graph(&self.engine, program).await {
+        match exec_state
+            .build_artifact_graph(&self.engine, program, &self.cache)
+            .await
+        {
             Ok(_) => exec_result,
             Err(err) => exec_result.and_then(|env_ref| Err((err, Some(env_ref)))),
         }
@@ -5686,6 +5689,52 @@ solid7 = extrude(r7, length = width)
         assert_eq!(
             outcome_id, real_id,
             "ExecOutcome must expose the real engine id, not the interpreter id"
+        );
+
+        ctx.close().await;
+    }
+
+    /// The other half of the same output-boundary gap: the artifact graph is
+    /// built from the same untranslated `ArtifactCommand`s the engine never
+    /// sees, so an offsetPlane's `Plane` node used to be keyed by the
+    /// interpreter id too. The frontend looks plane nodes up by the id the
+    /// engine reports back on selection (the real id), so a mismatch here
+    /// silently breaks clicking an offset plane in the 3D viewport.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_cache_spike_artifact_graph_exposes_the_real_id_not_the_interpreter_id() {
+        let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
+        let program = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
+
+        let mut exec_state = ExecState::new(&ctx);
+        let (main_ref, _) = ctx.run(&program, &mut exec_state).await.unwrap();
+
+        let vars = exec_state.mod_local.variables(main_ref).unwrap();
+        let interpreter_id = match vars.get("plane001").unwrap() {
+            KclValue::Plane { value } => value.id,
+            other => panic!("expected a plane, got {other:?}"),
+        };
+        let real_id = ctx
+            .cache
+            .real_id_of(interpreter_id)
+            .await
+            .expect("resolved by the root block's flush inside ctx.run()");
+        assert_ne!(
+            interpreter_id, real_id,
+            "this test is only meaningful if the two ids actually differ"
+        );
+
+        let plane_in_graph = exec_state
+            .global
+            .artifacts
+            .graph
+            .iter()
+            .find_map(|(id, artifact)| matches!(artifact, Artifact::Plane(_)).then_some(*id))
+            .expect("offsetPlane should have produced a Plane artifact node");
+
+        assert_eq!(
+            uuid::Uuid::from(plane_in_graph),
+            real_id,
+            "the artifact graph's plane node must be addressed by the real id, not the interpreter id"
         );
 
         ctx.close().await;

@@ -432,7 +432,7 @@ or even unchanged-but-freshly-resent inputs.
 ## 5. The output-boundary translation problem
 
 Flagged by the task background as "completely undesigned." Narrower than
-feared once traced, and now **half done**:
+feared once traced, and now **done**:
 
 - `kcl_api::Object` (`scene_objects`, `source_range_to_object`) does **not**
   carry a real engine id at all — `Object.id: ObjectId` is a local `usize`
@@ -442,16 +442,24 @@ feared once traced, and now **half done**:
 - `ArtifactGraph` is already built as a single end-of-execution batch pass
   over the full `ArtifactCommand` log plus flattened engine responses
   (`state.rs::build_artifact_graph` ~1428, `artifact.rs::build_artifact_graph`
-  ~454) — not incrementally during interpretation. That is one well-defined
-  hook: feed that pass the interpreter-id-addressed `ArtifactCommand` log
-  (unchanged) plus the round table, and have it resolve to real ids (or,
-  more likely, leave the graph itself keyed on interpreter ids internally
-  and only translate at serialization to the frontend, if anything downstream
-  of it needs a real id at all — needs checking against what the frontend
-  actually consumes from artifact graph nodes). **Still not done** - the
-  artifact graph (and therefore an offsetPlane's node in it) may still carry
-  the interpreter id; this needs the same direct read of `artifact.rs`'s
-  graph node types the original note called for, before implementing it.
+  ~454) — not incrementally during interpretation. **Done.** Confirmed by
+  direct trace (`src/lib/selectSketchPlane.ts`,
+  `src/hooks/useEngineConnectionSubscriptions.ts`) that the frontend does
+  look plane artifact-graph nodes up by the id the engine reports back on
+  selection in the 3D viewport — the real id, not the interpreter id — so
+  this was a live gap, not a theoretical one. Fixed by translating
+  `new_commands` (each `ArtifactCommand`'s `cmd_id`, every id-reference field
+  via `IdRefs::for_each_id_ref_mut`, and `EntityCloneInfo`'s three
+  `ArtifactId` fields) through `Cache::resolved_entity_ids()` right before
+  they're handed to `artifact::build_artifact_graph` — same translate-in-place
+  shape as `ExecOutcome.variables` below, reusing the already-built resolved-id
+  map rather than threading a new one through. A no-op whenever the map is
+  empty, i.e. for every execution that doesn't touch the deferred mechanism.
+  Verified end-to-end with a new test
+  (`command_cache_spike_artifact_graph_exposes_the_real_id_not_the_interpreter_id`)
+  that runs an `offsetPlane`, confirms interpreter id and real id actually
+  differ (so the assertion is meaningful), then asserts the `Plane` node in
+  `exec_state.global.artifacts.graph` is keyed by the real id.
 - `ExecOutcome.variables: IndexMap<String, KclValueView>` **— done.** Every
   `Solid`/`Sketch`/`Plane`/`Helix`/`ImportedGeometry`/`GdtAnnotation`'s `.id`
   (and `.artifact_id` for `Plane`/`Helix`, which the established codebase
@@ -472,13 +480,12 @@ feared once traced, and now **half done**:
   that exercises `ExecState::into_exec_outcome` itself, not just the
   pre-translation state the other two spike tests read directly.
 
-Net: the output-boundary problem was two call sites, as predicted. One
-(`ExecOutcome.variables`) is done; the other (`build_artifact_graph`'s
-inputs) is not, and is the one remaining known gap for `offsetPlane` - its
-artifact-graph node may still be addressed by interpreter id rather than
-the real one, which could show up as a mismatch anywhere the frontend
-correlates a KCL value's (now-correct) real id against the artifact graph's
-(still interpreter-addressed) one for an offsetPlane specifically.
+Net: the output-boundary problem was two call sites, as predicted, and both
+are now done: `ExecOutcome.variables` and `build_artifact_graph`'s inputs
+both translate interpreter ids to real ids before anything outside kcl-lib
+sees them, closing the gap that would otherwise have shown up as a mismatch
+between an offsetPlane's (now-correct) real-id-addressed `KclValueView` and
+its (previously still interpreter-addressed) artifact-graph node.
 
 ## 6. Suggested implementation order
 
@@ -545,15 +552,19 @@ correlates a KCL value's (now-correct) real id against the artifact graph's
      network access this environment doesn't have, confirmed unrelated by
      inspecting their panics), and the one test this step actually changes
      the behavior of flips from failing to passing only on this branch.
-5. **Partly done.** Output-boundary rewrite (§5): `ExecOutcome.variables` is
+5. **Done.** Output-boundary rewrite (§5): `ExecOutcome.variables` is
    fixed - both `into_exec_outcome` implementations now translate
    interpreter ids back to real ids via the new `translate_kcl_value_ids`,
-   verified end-to-end (see §5 above). **Still open:** `ArtifactGraph` -
-   `build_artifact_graph`'s own inputs/outputs were not touched, so an
-   offsetPlane's artifact-graph node may still be interpreter-addressed
-   while the same plane's `KclValueView` is now correctly real-id-addressed.
-   Whether this actually matters depends on what the frontend does with
-   artifact graph node ids for a plane specifically - not yet checked.
+   verified end-to-end (see §5 above). `ArtifactGraph` is also fixed -
+   `ExecState::build_artifact_graph` now translates each `ArtifactCommand`
+   (via `IdRefs` and `Cache::resolved_entity_ids()`) before building the
+   graph, so an offsetPlane's `Plane` node is addressed by the real id, same
+   as the plane's `KclValueView`. Confirmed this mattered for real (not just
+   in theory) by tracing the frontend's plane-selection path
+   (`selectSketchPlane.ts` → `kclManager.artifactGraph.get(planeOrFaceId)`,
+   fed by the engine's own selection event, which reports the real id) before
+   implementing the fix. Verified end-to-end with a new test
+   (`command_cache_spike_artifact_graph_exposes_the_real_id_not_the_interpreter_id`).
 6. Response caching (§4): separate follow-up, not a prerequisite for 1-5.
 
 Each step should land as its own reviewable commit with its own tests, same

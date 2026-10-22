@@ -33,6 +33,7 @@ use crate::execution::Artifact;
 use crate::execution::ArtifactCommand;
 use crate::execution::ArtifactGraph;
 use crate::execution::ArtifactId;
+use crate::execution::Cache;
 use crate::execution::ConstrainableLine2d;
 use crate::execution::EnvironmentRef;
 use crate::execution::ExecOutcome;
@@ -47,6 +48,7 @@ use crate::execution::UnsolvedSegment;
 use crate::execution::annotations;
 use crate::execution::cache::translate_kcl_value_ids;
 use crate::execution::cad_op::Operation;
+use crate::execution::command_cache::IdRefs;
 use crate::execution::id_generator::IdGenerator;
 #[cfg(test)]
 use crate::execution::memory::MemoryBackendKind;
@@ -1444,6 +1446,7 @@ impl ExecState {
         &mut self,
         engine: &Arc<EngineManager>,
         program: NodeRef<'_, crate::parsing::ast::types::Program>,
+        cache: &Cache,
     ) -> Result<(), KclError> {
         let mut new_commands = Vec::new();
         let mut new_exec_artifacts = IndexMap::new();
@@ -1463,6 +1466,36 @@ impl ExecState {
         // Take from the module artifacts so that we don't try to process them
         // again next time due to execution caching.
         new_commands.extend(self.global.root_module_artifacts.process_commands());
+
+        // Translate every interpreter id the deferred content-cache
+        // mechanism (see `execution::command_cache`'s SS2) left on a
+        // command's own id or a reference field back to the real engine id
+        // - the artifact graph is built from exactly these `cmd_id`s (see
+        // `artifact::artifacts_to_update`), and the engine only ever knows
+        // the real ones, so a frontend id lookup (e.g. clicking a plane in
+        // the 3D viewport, which reports the engine's id) against an
+        // untranslated graph node would silently fail to match. A no-op
+        // for every id that was never part of that mechanism - everything
+        // except `offsetPlane`'s planes today.
+        let resolved = cache.resolved_entity_ids().await;
+        if !resolved.is_empty() {
+            let translate = |id: Uuid| resolved.get(&id).copied().unwrap_or(id);
+            for artifact_command in &mut new_commands {
+                artifact_command.cmd_id = translate(artifact_command.cmd_id);
+                artifact_command
+                    .command
+                    .for_each_id_ref_mut(&mut |id| *id = translate(*id));
+                if let Some(entity_clone_info) = &mut artifact_command.entity_clone_info {
+                    entity_clone_info.source_artifact_id =
+                        translate(Uuid::from(entity_clone_info.source_artifact_id)).into();
+                    entity_clone_info.result_artifact_id =
+                        translate(Uuid::from(entity_clone_info.result_artifact_id)).into();
+                    entity_clone_info.source_topology_id =
+                        translate(Uuid::from(entity_clone_info.source_topology_id)).into();
+                }
+            }
+        }
+
         // Note: These will get re-processed, but since we're just adding them
         // to a map, it's fine.
         new_exec_artifacts.extend(self.global.root_module_artifacts.artifacts.clone());
