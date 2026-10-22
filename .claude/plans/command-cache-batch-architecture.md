@@ -699,6 +699,103 @@ its (previously still interpreter-addressed) artifact-graph node.
    §4's own caveats on why guessing at that classification instead of
    verifying it per command would be worse than not generalizing further
    yet.
+8. **Done.** Generalized to `std/extrude.rs`'s follow-up queries - the gap
+   step 7 flagged. Scoped to the cleanest sub-case: the `is_edge` surface-
+   extrude-of-an-edge path (`inner_extrude`'s `is_edge` branch +
+   `after_surface_creation`), which always uses `ExtrudeMethod::New` (no
+   merge/clone/cap-tag complexity) and whose follow-up query
+   (`EntityGetAllChildUuids`) references the extrude's own result id
+   directly, with none of the sketch/face-based paths' id-reuse subtlety
+   (traced in detail before touching anything: for a plain sketch-based
+   extrude, the resulting solid's *engine*-addressable id is the profile's
+   own pre-existing id, promoted by the engine itself, not the Extrude
+   command's `cmd_id` - `extrude_cmd_id` there is an artifact-graph-only
+   bookkeeping id, already handled generically by step 5's
+   `build_artifact_graph` fix, with nothing further needed; only the
+   edge-surface-extrude and face-based-New cases actually feed
+   `extrude_cmd_id` into a later engine-addressed reference).
+
+   **Found a second, more fundamental gap while tracing exactly how the
+   follow-up query would need to resolve its reference, before writing any
+   code (the investigation discipline §3.2's caveats call for, repeated
+   here for the same reason):** `IdRefs`-based reference translation only
+   ever happened inside `ExecState::flush_batch`, and only for a command
+   whose *own* id happened to be one of this round's registered
+   creation/mutation steps (`decisions.get(&req_inner.cmd_id.0)`) - a
+   command that merely *references* a registered entity without being
+   registered itself (`ObjectBringToFront` naming a solid, for instance)
+   fell into flush_batch's `None` arm and was never translated at all. Worse:
+   a *blocking* call (`ExecState::send_modeling_cmd`/`async_modeling_cmd`)
+   bypasses the queue entirely - `EngineManager::send_modeling_cmd` drains
+   the pending queue itself via its own `take_batch()`, merges in the
+   blocking call's own command, and sends everything, all without ever
+   calling `with_pending_batch`/`resolve_pending` - so a hit sitting in the
+   queue at that moment would be sent anyway (never dropped), and neither
+   the queue's references nor the blocking call's own command would be
+   translated. Both gaps were real for `offsetPlane`/default-plane creation
+   too, already live since steps 4/7 - just never hit, because nothing
+   previously registered via this mechanism was ever referenced by a
+   *separate*, non-registered command, let alone from inside a blocking
+   call, until `extrude.rs`'s surface-extrude-of-an-edge path needed
+   exactly that (`ObjectBringToFront`/`EntityGetAllChildUuids`, both
+   referencing `extrude_cmd_id`).
+
+   **Fix, in `execution/modeling.rs`:** unified the resolve-and-translate
+   logic that used to live only in `flush_batch` into a single
+   `ExecState::resolve_and_translate_pending` helper, called now from
+   `flush_batch`, `send_modeling_cmd`, `send_untracked_modeling_cmd`, and
+   `async_modeling_cmd` alike. Two changes from the old `flush_batch`-only
+   logic: (a) every surviving queued command gets its `IdRefs`-declared
+   reference fields rewritten unconditionally via the round's full
+   `resolved_entity_ids()` map, not just a command that is itself one of
+   the round's registered decisions; (b) each blocking-call wrapper now
+   also runs this resolution *before* building its own outgoing command,
+   and translates that command's own reference fields the same way - the
+   queued-batch rewrite alone can never reach it, since it was never
+   queued. Always re-reads the full accumulated map (not just what became
+   newly resolved on this exact call), so a reference added in a later,
+   separate call to an entity resolved in an earlier one is still fixed,
+   not just the common case of registration and reference happening in the
+   same window. A cheap no-op (one empty-map check, nothing else) for
+   every call that doesn't touch the mechanism at all - unchanged behavior
+   for everything except `std/sketch.rs`'s/`std/planes.rs`'s plane creation
+   and, now, `std/extrude.rs`'s edge-surface extrude.
+
+   With that fixed, `std/extrude.rs`'s own change is small: mint
+   `extrude_cmd_id` as before (unchanged `next_uuid()` call), hash the
+   actual `Extrude`/`TwistExtrude` command about to be queued, and
+   `register_creation` it - exactly the `std/planes.rs` pattern, nothing
+   extrude-specific beyond that. `after_surface_creation` needed **no
+   changes at all**: it already passes `extrude_cmd_id` straight into
+   `ObjectBringToFront` (queued) and `EntityGetAllChildUuids` (blocking),
+   and the newly-generic `resolve_and_translate_pending` now resolves both
+   correctly on its own, the same way `IdRefs` already does for every
+   other reference field in the app - no manual `real_id_of` calls needed
+   anywhere in `extrude.rs`.
+
+   **Verified:** this environment has no `ZOO_API_TOKEN`, and the mock
+   engine's transport (`mock_transport.rs`) returns `OkModelingCmdResponse::
+   Empty` for every request regardless of what was asked, so no test here
+   could get a real, correctly-typed response out of an actual geometry
+   pipeline (`region`/`extrude`/edge queries) - confirmed by hand before
+   attempting one (a probe test hit exactly this: `region()` came back
+   empty against the mock, failing extrude with "Expected a non-empty
+   sketch" before ever reaching the code this step touches). Since the fix
+   lives entirely in `modeling.rs`'s generic dispatch, not in anything
+   geometry-specific, it's tested directly there instead, with synthetic
+   commands standing in for `ObjectBringToFront`/`EntityGetAllChildUuids`
+   (`command_cache_spike_resolve_and_translate_pending_fixes_references_not_just_self_registrations`):
+   a two-round setup (mirroring the existing insertion test) proves a
+   queued reference-only command and a blocking call's own command both
+   get translated to a real id that genuinely differs from this round's
+   interpreter id, inspected via `EngineBatchContext::with_pending_batch`'s
+   existing peek/rewrite hook for the queue and via the `ArtifactCommand`
+   `send_modeling_cmd` pushes (captured *after* translation) for the
+   blocking call. Full regression sweep (`execution::`, `std::sketch::`,
+   `std::planes::`, `std::extrude::`, `engine::`, `command_cache`, plus the
+   complete `simulation_tests::` suite, given `modeling.rs`'s dispatch
+   functions are used by nearly every `std/` module) matches the
+   pre-existing `ZOO_API_TOKEN`-only baseline exactly, zero new failures.
 
 Each step should land as its own reviewable commit with its own tests, same
 as the three commits already on this branch — this doc is deliberately not

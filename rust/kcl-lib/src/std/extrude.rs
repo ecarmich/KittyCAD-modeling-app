@@ -942,6 +942,29 @@ async fn inner_extrude(
                 }
             }
 
+            // This entity's real engine id is decided by the same deferred,
+            // content-addressed mechanism `std/sketch.rs`'s/`std/planes.rs`'s
+            // plane creation already use (see `execution::command_cache`'s
+            // SS2/SS4 and `ExecState::resolve_and_translate_pending`):
+            // `extrude_cmd_id` above is only the *interpreter* id, bound
+            // into the `Solid` this function returns as-is and never
+            // rewritten here - every later reference to it (the queued
+            // `ObjectBringToFront` and the blocking `EntityGetAllChildUuids`
+            // query inside `after_surface_creation` below, the artifact
+            // graph, `ExecOutcome`) is translated to the real id generically,
+            // wherever it's eventually used, not by this function.
+            let extrude_content_id =
+                crate::execution::command_cache::content_id_from_bytes(&serde_json::to_vec(&cmd).map_err(|e| {
+                    KclError::new_internal(KclErrorDetails::new(
+                        format!("failed to serialize Extrude for content hashing: {e}"),
+                        vec![args.source_range],
+                    ))
+                })?);
+            args.ctx
+                .cache
+                .register_creation(extrude_cmd_id, extrude_content_id)
+                .await;
+
             // Surface-extrude an edge.
             exec_state
                 .batch_modeling_cmd(ModelingCmdMeta::from_args_id(exec_state, &args, extrude_cmd_id), cmd)

@@ -5779,6 +5779,139 @@ solid7 = extrude(r7, length = width)
         ctx.close().await;
     }
 
+    /// Found while generalizing the deferred content-cache mechanism
+    /// (design note SS2/SS4) past `std/planes.rs` to `std/extrude.rs`'s
+    /// surface-extrude-of-an-edge path (SS6 step 8): closes two gaps in
+    /// what `ExecState::flush_batch` translated, now unified into
+    /// `ExecState::resolve_and_translate_pending`.
+    ///
+    /// (1) A queued command that only *references* a registered entity,
+    /// without being a registered step itself (e.g. `ObjectBringToFront`
+    /// naming a solid whose own creation went through the mechanism -
+    /// `after_surface_creation`'s real use of it), used to never get that
+    /// reference field translated - only a command whose own id happened
+    /// to be a registered step did.
+    ///
+    /// (2) A blocking call (`ExecState::send_modeling_cmd`) bypasses the
+    /// queue entirely, so even a correctly-translated queue never helps a
+    /// reference embedded in the blocking call's *own* command -
+    /// `after_surface_creation`'s `EntityGetAllChildUuids` query is
+    /// exactly such a call.
+    ///
+    /// Exercised directly against `ExecState`'s dispatch methods with
+    /// synthetic commands, not through a real KCL program: this
+    /// environment has no `ZOO_API_TOKEN`, and the mock engine's
+    /// transport returns `Empty` for every request (see
+    /// `mock_transport.rs`), so no test here could get a real, correctly
+    /// typed response out of an actual geometry pipeline (`extrude`,
+    /// `region`, etc.) - the fix lives entirely in this dispatch code, not
+    /// anything geometry-specific, so testing it directly here is both
+    /// sufficient and far more precise than routing through KCL source.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_cache_spike_resolve_and_translate_pending_fixes_references_not_just_self_registrations() {
+        let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
+
+        // Round A: register one entity and resolve it immediately (a
+        // miss, nothing to match against yet) - its real id ends up equal
+        // to its own interpreter id (see `CommandCacheRound::
+        // resolve_pending`'s doc comment on why that's the correct,
+        // deterministic behavior for a miss), which is why round A's own
+        // ids aren't interesting to assert on - only round B's, below,
+        // where a hit actually changes something.
+        let mut exec_state_a = ExecState::new(&ctx);
+        let entity_a = exec_state_a.next_uuid();
+        let content = command_cache::content_id_from_bytes(b"synthetic entity for resolve_and_translate_pending test");
+        ctx.cache.register_creation(entity_a, content).await;
+        exec_state_a.resolve_and_translate_pending(&ctx).await;
+        ctx.cache.finish_command_cache_round().await;
+
+        // Round B: a genuinely *different* interpreter id, same content -
+        // this must resolve as a hit against round A's log, reusing round
+        // A's real id (== `entity_a`) rather than minting anything new.
+        let mut exec_state_b = ExecState::new(&ctx);
+        let entity_b = uuid::Uuid::new_v4();
+        ctx.cache.register_creation(entity_b, content).await;
+
+        // (1) Queue a command that only *references* `entity_b`, without
+        // itself being a registered step.
+        exec_state_b
+            .batch_modeling_cmd(
+                ModelingCmdMeta::new(&exec_state_b, &ctx, SourceRange::default()),
+                ModelingCmd::from(mcmd::ObjectBringToFront::builder().object_id(entity_b).build()),
+            )
+            .await
+            .unwrap();
+
+        // Resolve directly - not via `flush_batch`, which would
+        // immediately drain and send the queue - so the rewritten-in-place
+        // queue can still be inspected below, exactly as it would sit
+        // right before a real flush sends it.
+        let entity_real_ids = exec_state_b.resolve_and_translate_pending(&ctx).await;
+        let real_id_b = *entity_real_ids
+            .get(&entity_b)
+            .expect("entity_b was just registered and resolved above");
+        assert_eq!(
+            real_id_b, entity_a,
+            "a hit must reuse round A's real id, not mint a new one"
+        );
+        assert_ne!(
+            entity_b, real_id_b,
+            "this test is only meaningful if the hit's real id actually differs from this round's interpreter id"
+        );
+
+        let mut captured_queue = Vec::new();
+        ctx.engine_batch
+            .with_pending_batch(|batch| {
+                captured_queue = batch.clone();
+                batch
+            })
+            .await;
+        let object_bring_to_front_id = captured_queue.iter().find_map(|(req, _)| match req {
+            kcmc::websocket::WebSocketRequest::ModelingCmdReq(r) => match &r.cmd {
+                ModelingCmd::ObjectBringToFront(c) => Some(c.object_id),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            object_bring_to_front_id,
+            Some(real_id_b),
+            "a queued command that only references a registered entity must still have that reference translated to the real id"
+        );
+
+        // (2) A blocking call referencing the same entity, built *after*
+        // the queue above was already resolved - `send_modeling_cmd`
+        // bypasses the queue entirely (there is nothing left in it to
+        // bypass, by this point, but the point is that the blocking
+        // call's *own* incoming command gets translated too, not just
+        // whatever happened to already be queued).
+        exec_state_b
+            .send_modeling_cmd(
+                ModelingCmdMeta::new(&exec_state_b, &ctx, SourceRange::default()),
+                ModelingCmd::from(mcmd::EntityGetAllChildUuids::builder().entity_id(entity_b).build()),
+            )
+            .await
+            .unwrap();
+        let last_command = exec_state_b
+            .mod_local
+            .artifacts
+            .unprocessed_commands
+            .last()
+            .expect("send_modeling_cmd just pushed one");
+        let ModelingCmd::EntityGetAllChildUuids(sent) = &last_command.command else {
+            panic!(
+                "expected the just-sent EntityGetAllChildUuids, got {:?}",
+                last_command.command
+            );
+        };
+        assert_eq!(
+            sent.entity_id, real_id_b,
+            "a blocking call's own command must have its reference translated to the real id too, not just anything already queued"
+        );
+
+        ctx.close().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn cached_execution_phases_preserve_edits_settings_and_error_recovery() {
         let mut ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());

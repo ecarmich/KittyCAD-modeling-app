@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ahash::AHashSet;
 use kcmc::ModelingCmd;
 use kittycad_modeling_cmds::websocket::ModelingCmdReq;
@@ -213,10 +215,23 @@ impl ExecState {
     pub(crate) async fn send_modeling_cmd(
         &mut self,
         mut meta: ModelingCmdMeta<'_>,
-        cmd: ModelingCmd,
+        mut cmd: ModelingCmd,
     ) -> Result<OkWebSocketResponseData, KclError> {
         if self.is_in_sketch_block() {
             return Err(no_modeling_in_sketch_block_error(meta.source_range));
+        }
+        // A blocking send bypasses the queue entirely (this command was
+        // never in it), so the queued-batch rewrite inside
+        // `resolve_and_translate_pending` never sees it - translate its own
+        // reference fields here too, using the same map, before anything
+        // below builds on it. See that function's doc comment.
+        let entity_real_ids = self.resolve_and_translate_pending(meta.ctx).await;
+        if !entity_real_ids.is_empty() {
+            cmd.for_each_id_ref_mut(&mut |rid| {
+                if let Some(real) = entity_real_ids.get(rid) {
+                    *rid = *real;
+                }
+            });
         }
         let id = meta.id(self.id_generator());
         self.push_command(ArtifactCommand {
@@ -237,10 +252,19 @@ impl ExecState {
     pub(crate) async fn send_untracked_modeling_cmd(
         &mut self,
         mut meta: ModelingCmdMeta<'_>,
-        cmd: ModelingCmd,
+        mut cmd: ModelingCmd,
     ) -> Result<OkWebSocketResponseData, KclError> {
         if self.is_in_sketch_block() {
             return Err(no_modeling_in_sketch_block_error(meta.source_range));
+        }
+        // See `send_modeling_cmd`'s matching comment.
+        let entity_real_ids = self.resolve_and_translate_pending(meta.ctx).await;
+        if !entity_real_ids.is_empty() {
+            cmd.for_each_id_ref_mut(&mut |rid| {
+                if let Some(real) = entity_real_ids.get(rid) {
+                    *rid = *real;
+                }
+            });
         }
         let id = meta.id(self.id_generator());
         self.push_command(ArtifactCommand {
@@ -266,8 +290,18 @@ impl ExecState {
         if self.is_in_sketch_block() {
             return Err(no_modeling_in_sketch_block_error(meta.source_range));
         }
+        // See `send_modeling_cmd`'s matching comment.
+        let entity_real_ids = self.resolve_and_translate_pending(meta.ctx).await;
+        let mut cmd = cmd.clone();
+        if !entity_real_ids.is_empty() {
+            cmd.for_each_id_ref_mut(&mut |rid| {
+                if let Some(real) = entity_real_ids.get(rid) {
+                    *rid = *real;
+                }
+            });
+        }
         let id = meta.id(self.id_generator());
-        let tracked_command = match cmd {
+        let tracked_command = match &cmd {
             ModelingCmd::ImportFiles(import_files) => {
                 // Graph construction does not read imported file bytes. Retain the file paths
                 // and format in execution state without duplicating the full input payload.
@@ -286,7 +320,77 @@ impl ExecState {
             entity_clone_info: None,
             omit_from_graph: false,
         });
-        meta.ctx.engine.async_modeling_cmd(id, meta.source_range, cmd).await
+        meta.ctx.engine.async_modeling_cmd(id, meta.source_range, &cmd).await
+    }
+
+    /// Resolve anything the deferred content-cache mechanism (see
+    /// `execution::command_cache`) has registered since the last call, and
+    /// translate/filter the currently-queued-but-unsent batch in place
+    /// before it's actually sent: a cache hit is dropped entirely, and
+    /// *every* surviving command gets any id-reference field `IdRefs` finds
+    /// rewritten from interpreter id to real id - not just a command whose
+    /// own id happens to be one of this round's registered steps. That
+    /// distinction matters: a command can reference a registered entity
+    /// (e.g. `ObjectBringToFront` naming a solid whose creation went
+    /// through the mechanism) without being registered itself, and an
+    /// earlier version of this function only rewrote the former kind,
+    /// silently leaving the latter's references pointing at an interpreter
+    /// id the engine has never heard of.
+    ///
+    /// Returns the round's full interpreter-id -> real-id map (empty if
+    /// nothing has ever been registered this round), so a caller about to
+    /// send one *more* command directly - bypassing the queue entirely, as
+    /// every blocking call below does - can translate that command's own
+    /// reference fields the same way before handing it to the engine; the
+    /// queued-batch rewrite above never sees that command, since it was
+    /// never queued. Always re-reads the full accumulated map (not just
+    /// what became newly resolved on this call) so a reference added in a
+    /// *later*, separate call to an entity resolved in an *earlier* one
+    /// still gets fixed, not just the common case of registration and
+    /// reference happening in the same window.
+    ///
+    /// A cheap no-op (immediately returns an empty map, touches nothing)
+    /// for every call that doesn't involve the mechanism at all - today,
+    /// every call except the ones `std/sketch.rs`'s/`std/planes.rs`'s plane
+    /// creation and `std/extrude.rs`'s edge-surface extrude queue into. See
+    /// the design note's SS2 and SS4.
+    pub(crate) async fn resolve_and_translate_pending(&self, ctx: &ExecutorContext) -> HashMap<Uuid, Uuid> {
+        let decisions = ctx.cache.resolve_pending().await;
+        let entity_real_ids = ctx.cache.resolved_entity_ids().await;
+        if entity_real_ids.is_empty() {
+            return entity_real_ids;
+        }
+        ctx.engine_batch
+            .with_pending_batch(|batch| {
+                batch
+                    .into_iter()
+                    .filter_map(|(mut req, range)| {
+                        let kcmc::websocket::WebSocketRequest::ModelingCmdReq(req_inner) = &mut req else {
+                            return Some((req, range));
+                        };
+                        // A hit: drop it, nothing to send.
+                        if let Some((_, true)) = decisions.get(&req_inner.cmd_id.0) {
+                            return None;
+                        }
+                        // A miss: rewrite this command's own id.
+                        if let Some((real_id, false)) = decisions.get(&req_inner.cmd_id.0) {
+                            req_inner.cmd_id = (*real_id).into();
+                        }
+                        // Whether or not this command is itself one of this
+                        // round's registered steps, translate every
+                        // reference field `IdRefs` finds - a no-op for any
+                        // id that isn't in `entity_real_ids`.
+                        req_inner.cmd.for_each_id_ref_mut(&mut |rid| {
+                            if let Some(real) = entity_real_ids.get(rid) {
+                                *rid = *real;
+                            }
+                        });
+                        Some((req, range))
+                    })
+                    .collect()
+            })
+            .await;
+        entity_real_ids
     }
 
     /// Force flush the batch queue.
@@ -301,50 +405,7 @@ impl ExecState {
             return Err(no_modeling_in_sketch_block_error(meta.source_range));
         }
 
-        // Resolve anything the deferred content-cache mechanism (see
-        // `execution::command_cache`) has registered since the last flush,
-        // and translate/filter this batch in place before it's actually
-        // sent - a cache hit is dropped entirely, a miss has its own id
-        // (and any reference field elsewhere pointing at the same entity)
-        // rewritten from interpreter id to real id. A cheap no-op for every
-        // flush that doesn't involve it - today, every flush except the
-        // ones `std/planes.rs`'s `offsetPlane` queues into. See the design
-        // note's SS2 and SS4.
-        let decisions = meta.ctx.cache.resolve_pending().await;
-        if !decisions.is_empty() {
-            let entity_real_ids = meta.ctx.cache.resolved_entity_ids().await;
-            meta.ctx
-                .engine_batch
-                .with_pending_batch(|batch| {
-                    batch
-                        .into_iter()
-                        .filter_map(|(mut req, range)| {
-                            let kcmc::websocket::WebSocketRequest::ModelingCmdReq(req_inner) = &mut req else {
-                                return Some((req, range));
-                            };
-                            match decisions.get(&req_inner.cmd_id.0) {
-                                // Not part of this round's mechanism - every
-                                // other command in the app, untouched.
-                                None => Some((req, range)),
-                                // A hit: drop it, nothing to send.
-                                Some((_, true)) => None,
-                                // A miss: rewrite this command's own id and
-                                // every reference field `IdRefs` finds.
-                                Some((real_id, false)) => {
-                                    req_inner.cmd_id = (*real_id).into();
-                                    req_inner.cmd.for_each_id_ref_mut(&mut |rid| {
-                                        if let Some(real) = entity_real_ids.get(rid) {
-                                            *rid = *real;
-                                        }
-                                    });
-                                    Some((req, range))
-                                }
-                            }
-                        })
-                        .collect()
-                })
-                .await;
-        }
+        self.resolve_and_translate_pending(meta.ctx).await;
 
         meta.ctx
             .engine
