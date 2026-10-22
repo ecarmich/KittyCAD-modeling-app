@@ -398,11 +398,14 @@ duplicate-content test below existing first.
   scope, the same way the spike's own insertion test gated this doc's first
   draft.
 
-## 4. Response caching (explicitly out of scope for this change)
+## 4. Response caching
 
 Flagged by the task background as coupled to reordering-robustness; it is
-coupled, but it should not be built alongside the id-translation work,
-because it needs a materially stronger assumption than anything else here.
+coupled, but it was not built alongside the id-translation work, because it
+needs a materially stronger assumption than anything else here. **Scoped to
+the provably-safe case and implemented standalone, same "prove the piece in
+isolation" stage as §3's `EntityChain`/`ChainLog` before they were wired in —
+not yet wired into any real call site; see the end of this section for why.**
 
 Everything in §§2-3 only ever decides *whether to resend a command whose
 result, if sent, provably doesn't change anything new* — on a hit, the old
@@ -420,14 +423,64 @@ own module doc currently needs to defend, and it degrades badly: a wrong
 response is fabricated geometry data silently propagated into further KCL
 evaluation, not a merely-suboptimal extra round trip.
 
-**If this is ever built, scope it to the provably-safe case only:** a query
-command (`Solid3dGetExtrusionFaceInfo`, `Solid3dGetAllEdgeFaces`, etc.)
-against an object whose *entire creation chain this round* was a hit (i.e.
-nothing along the way actually sent a command) — there, caching the old
-round's response is safe for the same "nothing was touched" reason as id
-reuse, not because the engine is assumed deterministic. Do not extend this to
-caching the output of a command that creates or mutates content from changed
-or even unchanged-but-freshly-resent inputs.
+**Scoped to the provably-safe case only:** a query command
+(`Solid3dGetExtrusionFaceInfo`, `Solid3dGetAllEdgeFaces`, etc.) against an
+object whose *entire creation chain this round* was a hit (i.e. nothing
+along the way actually sent a command) — there, caching the old round's
+response is safe for the same "nothing was touched" reason as id reuse, not
+because the engine is assumed deterministic. This explicitly does not extend
+to caching the output of a command that creates or mutates content from
+changed or even unchanged-but-freshly-resent inputs.
+
+**Implemented, standalone, in `command_cache.rs`:**
+
+- `query_content_id(target_chain_value, query_fields)` folds a query's
+  target's *current* `EntityChain` value together with the query's own
+  literal fields (any field that's itself an entity reference should already
+  have been substituted by *that* entity's current chain value, same rule as
+  every other content id in this module) into one `ContentId`, the same
+  hashing shape `EntityChain::extend` already uses for a mutation.
+- `ResponseCache<Response>` is deliberately just a type alias for
+  `CommandLog<Response>`, not a new type with new matching logic. The
+  insight that made this nearly free: the "entire creation chain was a
+  `FullHit`" safety condition the scoping above requires doesn't need to be
+  checked separately at all — it falls directly out of how
+  `query_content_id` is built. If the target's chain differs from last
+  round's by so much as one mutation (a genuine miss, or even a
+  `PartialHit` where something upstream of this exact query's target
+  changed), the folded-in chain value differs, so the content id differs, so
+  `CommandLog::match_next` reports a miss and the caller is forced to
+  actually query the engine — a stale response can never be reused by
+  accident, with zero new bookkeeping beyond what `CommandLog` already does
+  for everything else it caches.
+- Verified with three tests
+  (`response_cache_tests`): an unchanged entity's identical two rounds fold
+  to the same content id and reuse the cached response
+  (`a_query_against_an_unchanged_entity_reuses_last_rounds_response`); a
+  mutated entity's chain folds to a *different* content id and is correctly
+  forced to re-query, never serving the stale response
+  (`a_query_against_a_mutated_entity_never_reuses_the_stale_response`); and
+  two different queries against the very same unchanged entity (e.g. two
+  different edges of one solid) don't collide with each other
+  (`two_different_queries_against_the_same_entity_are_cached_independently`).
+
+**Why this is still not wired into any real call site:** `target_chain_value`
+only exists for an entity actually registered via
+`CommandCacheRound::register_creation`/`register_mutation` — and today
+that's only `std/planes.rs`'s two call sites (§6 step 4). None of the real
+query call sites this is meant for (`extrude.rs`'s
+`Solid3dGetExtrusionFaceInfo`/`EntityGetAllChildUuids`, `edge.rs`'s
+`Solid3dGetAllEdgeFaces` and friends, `csg.rs`'s booleans, etc. — see §1's
+list) query an entity the chain mechanism knows about at all yet, because
+solids aren't registered as chained entities — the same generalizing-past-
+`std/planes.rs` blocker §3.2's caveat and §6 step 3 already flag for the
+matcher itself applies identically here. Computing a `target_chain_value`
+from anything other than an actual resolved chain to work around that would
+be exactly the "looks generalized but still decides eagerly" trap §3.2
+already warns against, just one layer further out — so this stays an
+isolated, tested piece until that prerequisite (registering every
+entity-producing/mutating command via the chain mechanism, not just
+`MakePlane`/`PlaneSetColor`) actually lands.
 
 ## 5. The output-boundary translation problem
 
@@ -565,7 +618,15 @@ its (previously still interpreter-addressed) artifact-graph node.
    fed by the engine's own selection event, which reports the real id) before
    implementing the fix. Verified end-to-end with a new test
    (`command_cache_spike_artifact_graph_exposes_the_real_id_not_the_interpreter_id`).
-6. Response caching (§4): separate follow-up, not a prerequisite for 1-5.
+6. **Partly done.** Response caching (§4): separate follow-up, not a
+   prerequisite for 1-5. `query_content_id` and `ResponseCache` are
+   implemented and tested standalone in `command_cache.rs` (see §4). **Still
+   open:** wiring into any real query call site, which needs solids/edges/
+   faces registered via `register_creation`/`register_mutation` first - not
+   a prerequisite this step can shortcut, since computing a chain value any
+   other way would silently reintroduce the exact "looks generalized but
+   still decides eagerly" bug class step 3/4 already fixed for the matcher
+   itself (see §4's closing paragraph).
 
 Each step should land as its own reviewable commit with its own tests, same
 as the three commits already on this branch — this doc is deliberately not

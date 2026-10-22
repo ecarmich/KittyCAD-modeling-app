@@ -88,6 +88,17 @@
 //! test. **Not yet wired into anything real** - see [`match_round`]'s own
 //! doc comment for exactly why generalizing past the two hand-written
 //! call sites in `std/planes.rs` needs more than this module alone.
+//!
+//! # Response caching (query results), separate from id reuse
+//!
+//! Everything above decides whether to *send* a command. [`query_content_id`]
+//! and [`ResponseCache`] are a separate, narrower piece: whether a
+//! query-style command (one that reads state back rather than creating or
+//! mutating anything) even needs to go to the engine at all, when its
+//! target's chain proves nothing about it changed this round. See
+//! [`query_content_id`]'s doc comment for the correctness argument and
+//! [`ResponseCache`]'s for why this, too, is not yet wired into anything
+//! real.
 
 #![allow(dead_code)]
 
@@ -1047,6 +1058,69 @@ pub(crate) fn command_effect(cmd: &ModelingCmd) -> Option<CommandEffect> {
     }
 }
 
+/// Content id for a query-style (`CommandEffect::Query`) command's own
+/// result, so an unchanged query against an unchanged target can reuse last
+/// round's response instead of asking the engine again - see the design
+/// note's SS4 for the correctness argument this implements directly: this is
+/// safe only because a target whose chain is byte-identical to last round's
+/// has, by construction, had nothing sent for it this round (a `FullHit`,
+/// per [`ChainMatch::FullHit`]) - it is the same "nothing was touched" fact
+/// id reuse already relies on, not a new assumption that the engine is
+/// deterministic.
+///
+/// `target_chain_value` must be the query's target entity's *current*
+/// (fully resolved) chain value - [`EntityChain::current`] - folded in
+/// exactly the same way a mutation's content id is folded into the chain by
+/// [`EntityChain::extend`]. This is the only thing that makes the safety
+/// property automatic rather than a separately-tracked invariant: if the
+/// target's chain differs at all from last round's (anything short of a
+/// `FullHit` - a genuine miss, or a `PartialHit` where something upstream of
+/// this query's target *did* change), the folded-in chain value differs too,
+/// so the resulting content id differs, so [`CommandLog::match_next`]
+/// reports a miss and the caller is forced to actually query the engine -
+/// never a stale reuse by accident. A query against two different entities,
+/// or two different queries against the same entity (e.g.
+/// `Solid3dGetAllEdgeFaces` for two different edges of the same solid), stay
+/// distinguishable because `query_fields` - the query's own literal fields,
+/// not counting the fields that are themselves entity references (those
+/// should already have been substituted by their *own* current chain value,
+/// same rule as any other content id - see the module docs) - is folded in
+/// too.
+pub(crate) fn query_content_id(target_chain_value: ContentId, query_fields: &[u8]) -> ContentId {
+    let mut bytes = Vec::with_capacity(target_chain_value.len() + query_fields.len());
+    bytes.extend_from_slice(&target_chain_value);
+    bytes.extend_from_slice(query_fields);
+    content_id_from_bytes(&bytes)
+}
+
+/// A previous round's cached query responses, content-addressed exactly the
+/// way [`CommandLog`] addresses any other content, via [`query_content_id`].
+/// Deliberately just [`CommandLog`] itself under a self-documenting name,
+/// not a new type with new matching logic: a query response's safety
+/// property (never reusing one whose target actually changed) falls
+/// entirely out of how its content id is built, as [`query_content_id`]'s
+/// doc comment argues, not out of anything [`CommandLog`] would need to do
+/// differently for it. `superseded` is meaningless for this use (a response
+/// that goes unclaimed this round was simply a query nothing asked again -
+/// not a deletion to act on) and callers caching responses should ignore it.
+///
+/// **Not yet wired into anything real** - same standalone, tested-in-
+/// isolation scoping as the rest of this module's not-yet-wired pieces (see
+/// the module docs). Unlike those, this one has a hard prerequisite beyond
+/// its own wiring: `target_chain_value` only exists for an entity that was
+/// actually registered via [`CommandCacheRound::register_creation`]/
+/// [`CommandCacheRound::register_mutation`], and today that's only
+/// `std/planes.rs`'s two call sites (see [`match_round`]'s doc comment on
+/// why generalizing past them isn't safe yet). None of the real query call
+/// sites this is meant for (`extrude.rs`, `edge.rs`, `csg.rs`, etc. - see the
+/// design note's SS1) query an entity the chain mechanism knows about at
+/// all yet, so there is currently nothing real to wire this into - doing so
+/// before that prerequisite lands would mean computing `target_chain_value`
+/// from something other than an actual resolved chain, which is exactly the
+/// kind of "looks generalized but still decides eagerly" trap the design
+/// note's SS3.2 already warns against for the matcher itself.
+pub(crate) type ResponseCache<Response> = CommandLog<Response>;
+
 #[cfg(test)]
 mod id_refs_tests {
     use kittycad_modeling_cmds::each_cmd::BooleanImprint;
@@ -1466,5 +1540,87 @@ mod chain_tests {
         // A second, unrelated entity that only matches at the creation
         // level must not be handed the already-claimed old entity.
         assert_eq!(old.match_chain(&chain_of(&["plane"])), ChainMatch::Miss);
+    }
+}
+
+#[cfg(test)]
+mod response_cache_tests {
+    use super::*;
+
+    fn id(label: &str) -> ContentId {
+        content_id_from_bytes(label.as_bytes())
+    }
+
+    fn chain_of(levels: &[&str]) -> EntityChain {
+        let mut chain = EntityChain::new(id(levels[0]));
+        for level in &levels[1..] {
+            chain.extend(level.as_bytes());
+        }
+        chain
+    }
+
+    /// The core worked example: a query against an entity whose chain this
+    /// round is byte-identical to last round's (a `FullHit`, nothing sent
+    /// for it) reuses last round's cached response instead of needing to
+    /// query the engine again.
+    #[test]
+    fn a_query_against_an_unchanged_entity_reuses_last_rounds_response() {
+        let old_chain = chain_of(&["plane"]);
+        let old_query_id = query_content_id(old_chain.current(), b"edge_a");
+        let mut old_responses: ResponseCache<&str> = CommandLog::new(vec![LogEntry {
+            content_id: old_query_id,
+            payload: "faces=[1,2,3]",
+        }]);
+
+        // This round: same entity, nothing mutated it, so its chain is
+        // byte-identical to last round's - exactly what a `FullHit` means.
+        let new_chain = chain_of(&["plane"]);
+        let new_query_id = query_content_id(new_chain.current(), b"edge_a");
+        assert_eq!(
+            new_query_id, old_query_id,
+            "an unchanged entity's chain value must fold into an identical content id"
+        );
+
+        assert_eq!(
+            old_responses.match_next(new_query_id),
+            MatchDecision::Hit { old_index: 0 }
+        );
+        assert_eq!(*old_responses.payload(0), "faces=[1,2,3]");
+    }
+
+    /// The safety property this is actually for: if the entity being
+    /// queried was mutated (or recreated) this round - anything short of a
+    /// `FullHit` - its chain value differs, so the content id differs, so
+    /// the cache reports a miss and the caller is forced to ask the engine
+    /// for real. A stale response can never be reused by accident, because
+    /// nothing here ever reuses by anything other than exact content match.
+    #[test]
+    fn a_query_against_a_mutated_entity_never_reuses_the_stale_response() {
+        let old_chain = chain_of(&["plane"]);
+        let old_query_id = query_content_id(old_chain.current(), b"edge_a");
+        let mut old_responses: ResponseCache<&str> = CommandLog::new(vec![LogEntry {
+            content_id: old_query_id,
+            payload: "faces=[1,2,3]",
+        }]);
+
+        // This round: the same entity, but it picked up a mutation (e.g. a
+        // color change) since last round - its chain value is no longer
+        // byte-identical, even though the query's own fields didn't change.
+        let mutated_chain = chain_of(&["plane", "red"]);
+        let mutated_query_id = query_content_id(mutated_chain.current(), b"edge_a");
+        assert_ne!(mutated_query_id, old_query_id);
+        assert_eq!(old_responses.match_next(mutated_query_id), MatchDecision::Miss);
+    }
+
+    /// Two distinct queries against the very same unchanged entity (e.g.
+    /// `Solid3dGetAllEdgeFaces` for two different edges of one solid) must
+    /// not collide with each other just because they share a target - the
+    /// query's own fields are folded in too.
+    #[test]
+    fn two_different_queries_against_the_same_entity_are_cached_independently() {
+        let chain = chain_of(&["plane"]);
+        let query_a = query_content_id(chain.current(), b"edge_a");
+        let query_b = query_content_id(chain.current(), b"edge_b");
+        assert_ne!(query_a, query_b);
     }
 }
