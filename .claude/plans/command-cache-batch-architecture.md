@@ -627,6 +627,78 @@ its (previously still interpreter-addressed) artifact-graph node.
    other way would silently reintroduce the exact "looks generalized but
    still decides eagerly" bug class step 3/4 already fixed for the matcher
    itself (see §4's closing paragraph).
+7. **Done, first real generalization past `std/planes.rs`.**
+   `std/sketch.rs`'s `ensure_sketch_plane_in_engine` - the default-plane
+   (XY/XZ/YZ) creation path every KCL program that uses one of the standard
+   planes goes through - now uses the same deferred, content-addressed
+   mechanism `offsetPlane` already used (step 4): mint an interpreter id,
+   `register_creation` with the `MakePlane` command's content hash, queue
+   it, let flush-time translation decide the real id. No new mechanism was
+   needed - this is the *same command type* (`MakePlane`) at a second call
+   site, which step 3's revision note already anticipated would become safe
+   once step 2/4's interpreter-id/real-id split landed for real (it has).
+   Chosen deliberately over a genuinely new entity type (e.g. `extrude`'s
+   response-dependent solids) as the next, lowest-risk target: no new
+   command classification work, no mutation step, no response-dependent
+   follow-up query to also fix - see this section's closing note below on
+   why those are a separate, much larger undertaking.
+
+   **Found and fixed a real, previously-latent bug while generalizing:**
+   `CommandCacheRound::resolve_pending`'s two miss paths (`ChainMatch::Miss`
+   and the `None` "no previous round at all" branch) minted a fresh
+   `uuid::Uuid::new_v4()` for the real id on every miss, rather than
+   anything derived from the entity's own content or identity. This was
+   already live for `offsetPlane` since step 4, just never exercised by a
+   test that checks it: nothing previously asked whether the *same* program,
+   executed in two entirely independent, freshly-created `ExecutorContext`s
+   (no shared `Cache`, so always a first-round miss on both sides), produces
+   the *same* ids. Generalizing to default planes immediately broke exactly
+   that property for essentially every KCL program -
+   `execution::tests::mock_has_stable_ids` (two fresh mock contexts running
+   identical code, asserting identical artifact-graph ids) failed.
+   **Fix:** both miss paths now resolve the real id to the entity's own
+   creation-step id (`entity.steps[0]`, i.e. its interpreter id) -
+   deterministic, and exactly matching the pre-existing, long-standing
+   behavior from before this whole mechanism existed, when `next_uuid()`'s
+   output was sent directly as the wire id with nothing in between. A hit
+   still reuses whatever real id an *earlier* round resolved (possibly
+   different from this round's interpreter id, when the chain survived an
+   upstream reorder/insertion - step 4's actual point); only a genuine miss
+   changed. This fix is correctness-critical, not specific to default
+   planes: any other call site this mechanism is ever generalized to would
+   hit the identical bug under the identical conditions (first-ever
+   execution of a program, no shared history) if this weren't fixed first.
+
+   Two existing tests built on the now-corrected premise that a lone
+   first-ever round's interpreter id and real id simply *always* differ
+   (true only because of the random-miss bug) needed rewriting, not just
+   re-running: `command_cache_spike_exec_outcome_exposes_the_real_id_not_the_interpreter_id`
+   and `command_cache_spike_artifact_graph_exposes_the_real_id_not_the_interpreter_id`
+   now use the same two-round, insertion-shifts-the-interpreter-id structure
+   as `command_cache_spike_insertion_before_plane_is_reused_not_recreated`
+   (round A establishes a real id; round B inserts an unrelated statement
+   before `plane001`, shifting its interpreter id while its chain still
+   hits round A's log, so its real id stays pinned to round A's) - a case
+   where the two ids differ for a real, meaningful reason, not an
+   artificial one. `mock_has_stable_ids` and the rest of the targeted sweep
+   (`execution::`, `std::sketch::`, `std::planes::`, `engine::`,
+   `command_cache`, plus the full `simulation_tests::` snapshot suite as an
+   extra check, since default planes are this pervasive) all pass, matching
+   the pre-existing `ZOO_API_TOKEN`-only baseline with zero new failures.
+
+   **Why not go further than default planes in this step:** every other
+   entity-producing call site in `std/` (`extrude.rs`, `revolve.rs`,
+   `sweep.rs`, `loft.rs`, the booleans in `csg.rs`, etc.) either needs a
+   response-dependent id (the engine's response, not the interpreter,
+   reveals the real id - booleans, patterns, mirrors, clones) or has
+   follow-up blocking queries that reference the entity by id and would
+   also need rewriting to resolve through `real_id_of` before being sent
+   (`extrude.rs`'s `Solid3dGetExtrusionFaceInfo`/`EntityGetAllChildUuids`,
+   for instance). Both are real, additional engineering, not just "the same
+   pattern at a new call site" the way default planes were - see §3.2's and
+   §4's own caveats on why guessing at that classification instead of
+   verifying it per command would be worse than not generalizing further
+   yet.
 
 Each step should land as its own reviewable commit with its own tests, same
 as the three commits already on this branch — this doc is deliberately not

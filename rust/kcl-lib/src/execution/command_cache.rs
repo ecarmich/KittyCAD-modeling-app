@@ -537,7 +537,13 @@ impl CommandCacheRound {
                         }
                         ChainMatch::Miss => {
                             self.misses += 1;
-                            (uuid::Uuid::new_v4(), None)
+                            // No history to resolve a real id from - reuse
+                            // the entity's own creation (interpreter) id
+                            // deterministically, rather than minting a
+                            // fresh random one. See the `None` arm below
+                            // for why this matters far beyond this one
+                            // round.
+                            (self.entities[index].steps[0], None)
                         }
                     };
                     let entity = &self.entities[index];
@@ -550,11 +556,25 @@ impl CommandCacheRound {
             }
             None => {
                 // No previous round to match against at all (the very
-                // first run): every entity is a miss.
+                // first run): every entity is a miss. Resolves to its own
+                // creation (interpreter) id, deterministically, same as
+                // the `ChainMatch::Miss` arm above - not a fresh random
+                // id. This is what keeps ids reproducible across two
+                // entirely independent fresh executions of the same
+                // program (no shared `Cache`, so always this branch): the
+                // same pre-existing guarantee this codebase relied on
+                // before this mechanism existed, when every entity's wire
+                // id came directly from `next_uuid()`'s deterministic
+                // sequence with nothing in between. A random id here would
+                // silently break that guarantee for every entity this
+                // mechanism covers - not hypothetically: generalizing it
+                // to default planes (`std/sketch.rs`'s
+                // `ensure_sketch_plane_in_engine`) is exactly what
+                // surfaced this, via `execution::tests::mock_has_stable_ids`.
                 for &index in &pending {
                     self.misses += 1;
-                    let real_id = uuid::Uuid::new_v4();
                     let entity = &self.entities[index];
+                    let real_id = entity.steps[0];
                     self.entity_real_id.insert(entity.steps[0], real_id);
                     for &step_id in &entity.steps {
                         decisions.insert(step_id, (real_id, false));

@@ -1166,9 +1166,25 @@ pub async fn ensure_sketch_plane_in_engine(
     // causing a duplicate-ID error when execution caching keeps the scene alive
     // across incremental runs. Modules execute concurrently, so they cannot
     // generally share information.
-    let id = exec_state.next_uuid();
-    plane.id = id;
-    plane.artifact_id = id.into();
+    //
+    // This is the *interpreter* id (see `execution::command_cache`'s module
+    // docs and the design note's SS2): assigned now, used as this plane's
+    // identity for the rest of execution, never rewritten. The real engine
+    // id is decided later, at flush time, once this entity's chain is known
+    // - same deferred, content-addressed mechanism `std/planes.rs`'s
+    // `make_offset_plane_in_engine` already uses for `offsetPlane`, applied
+    // here to the far more common case of a default plane (XY/XZ/YZ),
+    // imported by essentially every KCL program. Two concurrently-executing
+    // modules minting identical `MakePlane` content for "the same" default
+    // plane is exactly the duplicate-content case this mechanism is already
+    // built and tested to disambiguate safely (see `command_cache.rs`'s
+    // `duplicate_content_pairs_with_earliest_unconsumed_occurrence_first`
+    // test) - each module's plane still resolves to its own, independently
+    // stable real id round over round; nothing here merges them into one
+    // engine entity.
+    let interpreter_id = exec_state.next_uuid();
+    plane.id = interpreter_id;
+    plane.artifact_id = interpreter_id.into();
 
     let clobber = false;
     let size = LengthUnit(60.0);
@@ -1191,9 +1207,21 @@ pub async fn ensure_sketch_plane_in_engine(
             .y_axis(plane.info.y_axis.into())
             .build()
     };
+    let make_plane_content_id =
+        crate::execution::command_cache::content_id_from_bytes(&serde_json::to_vec(&cmd).map_err(|e| {
+            KclError::new_internal(KclErrorDetails::new(
+                format!("failed to serialize MakePlane for content hashing: {e}"),
+                vec![source_range],
+            ))
+        })?);
+    ctx.cache.register_creation(interpreter_id, make_plane_content_id).await;
+
+    // Always queue it, under its interpreter id - whether it's actually
+    // sent, and with which real id, is decided later at flush time (see
+    // `ExecState::flush_batch`'s translation step).
     exec_state
         .batch_modeling_cmd(
-            ModelingCmdMeta::with_id(exec_state, ctx, source_range, plane.id),
+            ModelingCmdMeta::with_id(exec_state, ctx, source_range, interpreter_id),
             ModelingCmd::from(cmd),
         )
         .await?;
@@ -1203,7 +1231,7 @@ pub async fn ensure_sketch_plane_in_engine(
         kind: kcl_api::ObjectKind::Plane(kcl_api::Plane::Object(plane_object_id)),
         label: Default::default(),
         comments: Default::default(),
-        artifact_id: ArtifactId::new(plane.id),
+        artifact_id: plane.artifact_id,
         source: SourceRef::new(source_range, node_path.clone()),
     };
     exec_state.add_scene_object(plane_object, source_range);

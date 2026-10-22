@@ -5656,38 +5656,60 @@ solid7 = extrude(r7, length = width)
     /// path most real callers use - the other two tests above read
     /// `exec_state.mod_local.variables` directly, which bypasses it) and
     /// confirms it now resolves the real id, not the interpreter one.
+    ///
+    /// Needs two rounds, same as
+    /// `command_cache_spike_insertion_before_plane_is_reused_not_recreated`,
+    /// not just one: on a lone first-ever round there's no history to
+    /// resolve a real id from, so (since `resolve_pending`'s `None`/`Miss`
+    /// arms deterministically reuse the entity's own interpreter id rather
+    /// than minting a fresh random one - see their doc comments, and
+    /// `execution::tests::mock_has_stable_ids` for why that determinism
+    /// matters) the two ids are the *same* value then, which would make a
+    /// same-id assertion here vacuously true rather than actually
+    /// exercising the translation path. Round B's insertion shifts
+    /// `plane001`'s interpreter id away from round A's, while its real id
+    /// stays pinned to round A's (a hit) - exactly the situation where the
+    /// two differ for a real reason, not an artificial one.
     #[tokio::test(flavor = "multi_thread")]
     async fn command_cache_spike_exec_outcome_exposes_the_real_id_not_the_interpreter_id() {
         let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
-        let program = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
 
-        let mut exec_state = ExecState::new(&ctx);
-        let (main_ref, _) = ctx.run(&program, &mut exec_state).await.unwrap();
+        let program_a = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
+        let mut exec_state_a = ExecState::new(&ctx);
+        ctx.run(&program_a, &mut exec_state_a).await.unwrap();
+        ctx.cache.finish_command_cache_round().await;
 
-        // Ground truth, read the same way the other two tests here do,
+        let program_b = crate::Program::parse_no_errs(
+            "other = offsetPlane(XZ, offset = 3mm)\nplane001 = offsetPlane(XY, offset = 5mm)\n",
+        )
+        .unwrap();
+        let mut exec_state_b = ExecState::new(&ctx);
+        let (main_ref_b, _) = ctx.run(&program_b, &mut exec_state_b).await.unwrap();
+
+        // Ground truth, read the same way the other two tests above do,
         // bypassing translation entirely.
-        let vars = exec_state.mod_local.variables(main_ref).unwrap();
-        let interpreter_id = match vars.get("plane001").unwrap() {
+        let vars_b = exec_state_b.mod_local.variables(main_ref_b).unwrap();
+        let interpreter_id_b = match vars_b.get("plane001").unwrap() {
             KclValue::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
-        let real_id = ctx
+        let real_id_b = ctx
             .cache
-            .real_id_of(interpreter_id)
+            .real_id_of(interpreter_id_b)
             .await
             .expect("resolved by the root block's flush inside ctx.run()");
         assert_ne!(
-            interpreter_id, real_id,
+            interpreter_id_b, real_id_b,
             "this test is only meaningful if the two ids actually differ"
         );
 
-        let outcome = exec_state.into_exec_outcome(main_ref, &ctx).await.unwrap();
+        let outcome = exec_state_b.into_exec_outcome(main_ref_b, &ctx).await.unwrap();
         let outcome_id = match outcome.variables.get("plane001").unwrap() {
             KclValueView::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
         assert_eq!(
-            outcome_id, real_id,
+            outcome_id, real_id_b,
             "ExecOutcome must expose the real engine id, not the interpreter id"
         );
 
@@ -5700,41 +5722,58 @@ solid7 = extrude(r7, length = width)
     /// interpreter id too. The frontend looks plane nodes up by the id the
     /// engine reports back on selection (the real id), so a mismatch here
     /// silently breaks clicking an offset plane in the 3D viewport.
+    ///
+    /// Same two-round structure, and for the same reason, as the
+    /// `ExecOutcome` test just above - see its doc comment.
     #[tokio::test(flavor = "multi_thread")]
     async fn command_cache_spike_artifact_graph_exposes_the_real_id_not_the_interpreter_id() {
         let ctx = ExecutorContext::new_with_engine(Arc::new(EngineManager::new_mock()), Default::default());
-        let program = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
 
-        let mut exec_state = ExecState::new(&ctx);
-        let (main_ref, _) = ctx.run(&program, &mut exec_state).await.unwrap();
+        let program_a = crate::Program::parse_no_errs("plane001 = offsetPlane(XY, offset = 5mm)\n").unwrap();
+        let mut exec_state_a = ExecState::new(&ctx);
+        ctx.run(&program_a, &mut exec_state_a).await.unwrap();
+        ctx.cache.finish_command_cache_round().await;
 
-        let vars = exec_state.mod_local.variables(main_ref).unwrap();
-        let interpreter_id = match vars.get("plane001").unwrap() {
+        let program_b = crate::Program::parse_no_errs(
+            "other = offsetPlane(XZ, offset = 3mm)\nplane001 = offsetPlane(XY, offset = 5mm)\n",
+        )
+        .unwrap();
+        let mut exec_state_b = ExecState::new(&ctx);
+        let (main_ref_b, _) = ctx.run(&program_b, &mut exec_state_b).await.unwrap();
+
+        let vars_b = exec_state_b.mod_local.variables(main_ref_b).unwrap();
+        let interpreter_id_b = match vars_b.get("plane001").unwrap() {
             KclValue::Plane { value } => value.id,
             other => panic!("expected a plane, got {other:?}"),
         };
-        let real_id = ctx
+        let real_id_b = ctx
             .cache
-            .real_id_of(interpreter_id)
+            .real_id_of(interpreter_id_b)
             .await
             .expect("resolved by the root block's flush inside ctx.run()");
         assert_ne!(
-            interpreter_id, real_id,
+            interpreter_id_b, real_id_b,
             "this test is only meaningful if the two ids actually differ"
         );
 
-        let plane_in_graph = exec_state
+        // Two offsetPlanes exist in this round's graph (`other` and
+        // `plane001`), so check set membership rather than assuming
+        // `plane001`'s happens to be the first `Plane` node iteration
+        // finds - unambiguous regardless of graph iteration order.
+        let plane_ids_in_graph: Vec<uuid::Uuid> = exec_state_b
             .global
             .artifacts
             .graph
             .iter()
-            .find_map(|(id, artifact)| matches!(artifact, Artifact::Plane(_)).then_some(*id))
-            .expect("offsetPlane should have produced a Plane artifact node");
-
-        assert_eq!(
-            uuid::Uuid::from(plane_in_graph),
-            real_id,
-            "the artifact graph's plane node must be addressed by the real id, not the interpreter id"
+            .filter_map(|(id, artifact)| matches!(artifact, Artifact::Plane(_)).then_some(uuid::Uuid::from(*id)))
+            .collect();
+        assert!(
+            plane_ids_in_graph.contains(&real_id_b),
+            "the artifact graph must contain plane001's real id {real_id_b:?}, found {plane_ids_in_graph:?}"
+        );
+        assert!(
+            !plane_ids_in_graph.contains(&interpreter_id_b),
+            "the artifact graph must not contain plane001's untranslated interpreter id {interpreter_id_b:?}"
         );
 
         ctx.close().await;
